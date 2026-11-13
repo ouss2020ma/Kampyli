@@ -4,14 +4,19 @@
 /* ---------------- Analyseur d'expressions ---------------- */
 const PARAMS = {};
 let FN_REGISTRY = {};            // name -> compiled function
-const WORDS = ['arcsin','arccos','arctan','sqrt','rac','root','floor','ent','sin','cos','tan','exp','abs','min','max','ln','log','pi','E'];
+const WORDS = ['arcsin','arccos','arctan','pgcd','ppcm','gcd','lcm','sqrt','rac','root','floor','ent','sin','cos','tan','exp','abs','min','max','ln','log','pi','E'];
 const FUNCS = {
   sin:Math.sin, cos:Math.cos, tan:Math.tan, arcsin:Math.asin, arccos:Math.acos, arctan:Math.atan,
   sqrt:Math.sqrt, floor:Math.floor, ent:Math.floor, E:Math.floor, exp:Math.exp, abs:Math.abs,
-  ln:Math.log, log:Math.log10, min:Math.min, max:Math.max, rac:nroot, root:nroot
+  ln:Math.log, log:Math.log10, min:Math.min, max:Math.max, rac:nroot, root:nroot,
+  pgcd:pgcdN, gcd:pgcdN, ppcm:ppcmN, lcm:ppcmN
 };
+const isIntV=v=>isFinite(v)&&Math.abs(v-Math.round(v))<1e-9;
+function pgcd2(a,b){ a=Math.abs(Math.round(a)); b=Math.abs(Math.round(b)); while(b){ [a,b]=[b,a%b]; } return a; }
+function pgcdN(...v){ if(v.length<2||!v.every(isIntV)) return NaN; return v.reduce(pgcd2); }
+function ppcmN(...v){ if(v.length<2||!v.every(isIntV)) return NaN; return v.reduce((a,b)=>{ a=Math.abs(Math.round(a)); b=Math.abs(Math.round(b)); return a===0||b===0?0:a/pgcd2(a,b)*b; }); }
 function nroot(n,x){ if(!(Number.isInteger(n)&&n>=1)||!(x>=0)) return NaN; return n===1?x:n===2?Math.sqrt(x):n===3?Math.cbrt(x):Math.pow(x,1/n); }
-const MULTI = new Set(['min','max','rac','root']);
+const MULTI = new Set(['min','max','rac','root','pgcd','ppcm','gcd','lcm']);
 
 function preprocess(s){
   s = String(s);
@@ -61,7 +66,56 @@ function callFn(name,v,prime){
 }
 function tokName(k){ if(!k) return 'fin'; return k.t==='num'? String(k.v) : (k.v!==undefined? k.v : k.t); }
 
+/* ---- fonctions définies par morceaux : {expr si cond ; expr si cond ; expr sinon} ---- */
+const PW_SI=/(?<![A-Za-z])(si|if)(?![A-Za-z])/i, PW_ELSE=/(?<![A-Za-z])(sinon|else|ailleurs)(?![A-Za-z])/i;
+function splitTop(s,sep){ const out=[]; let d=0, cur='';
+  for(const c of s){ if('({'.includes(c)) d++; else if(')}'.includes(c)) d--; if(d===0&&c===sep){ out.push(cur); cur=''; } else cur+=c; }
+  out.push(cur); return out; }
+function pwBody(src){
+  let s=String(src).replace(/^\s*(?:[a-zA-Z]\s*\(\s*x\s*\)|y)\s*=/, '').trim();
+  if(!PW_SI.test(s)&&!PW_ELSE.test(s)) return null;
+  if(s.startsWith('{')&&s.endsWith('}')&&splitTop(s.slice(1,-1),'}').length===1) s=s.slice(1,-1);
+  return s;
+}
+function isPiecewise(src){ return pwBody(src)!==null; }
+function compileCond(c,names,self,params){
+  c=c.replace(/≤|=</g,'<=').replace(/≥|=>/g,'>=').replace(/≠|!=|<>/g,'≠').trim();
+  const parts=c.split(/\s+(?:et|and)\s+|&&|∧/i);
+  const preds=parts.map(part=>{
+    const tk=part.split(/(<=|>=|<|>|≠|=)/).map(t=>t.trim());
+    if(tk.length<3||tk.length%2===0||tk.some((t,i)=>i%2===0&&!t)) throw new Error(`Condition mal écrite : « ${part.trim()} »`);
+    const vals=[], ops=[];
+    tk.forEach((t,i)=>{ if(i%2){ ops.push(t); } else { const r=compile1(t,names,self); r.params.forEach(q=>params.add(q)); vals.push(r.fn); } });
+    return x=>{ for(let i=0;i<ops.length;i++){ const a=vals[i](x), b=vals[i+1](x), o=ops[i];
+      if(!(o==='<'?a<b:o==='<='?a<=b+1e-12:o==='>'?a>b:o==='>='?a>=b-1e-12:o==='='?Math.abs(a-b)<=1e-12*Math.max(1,Math.abs(a)):Math.abs(a-b)>1e-12*Math.max(1,Math.abs(a)))) return false; }
+      return true; };
+  });
+  // bornes constantes (pour les points de raccordement)
+  const bounds=[];
+  for(const part of parts){ part.split(/<=|>=|<|>|≠|=/).forEach(t=>{ t=t.trim(); if(t&&!/x/.test(t)){ try{ const r=compile1(t,names,self); bounds.push(r.fn); }catch(e){} } }); }
+  return {pred:x=>preds.every(p=>p(x)), bounds};
+}
 function compile(src, names, self){
+  const body=pwBody(src);
+  if(body===null) return compile1(src,names,self);
+  const pieces=splitTop(body,';').map(t=>t.trim()).filter(Boolean);
+  if(!pieces.length) throw new Error('Expression vide');
+  const params=new Set(), P=[], bounds=[]; let dflt=null;
+  for(const pc of pieces){
+    const mE=PW_ELSE.exec(pc), mS=PW_SI.exec(pc);
+    if(mE&&(!mS||mE.index<mS.index)){ const ex=pc.slice(0,mE.index).trim(); if(!ex) throw new Error('Morceau sans expression'); const r=compile1(ex,names,self); r.params.forEach(q=>params.add(q)); dflt=r.fn; continue; }
+    if(!mS){ const r=compile1(pc,names,self); r.params.forEach(q=>params.add(q)); dflt=r.fn; continue; }
+    const ex=pc.slice(0,mS.index).trim(), cd=pc.slice(mS.index+mS[0].length).trim();
+    if(!ex) throw new Error('Morceau sans expression'); if(!cd) throw new Error('Condition manquante après « si »');
+    const r=compile1(ex,names,self); r.params.forEach(q=>params.add(q));
+    const C=compileCond(cd,names,self,params); bounds.push(...C.bounds);
+    P.push({f:r.fn,c:C.pred});
+  }
+  const fn=x=>{ for(const p of P){ if(p.c(x)) return p.f(x); } return dflt?dflt(x):NaN; };
+  fn.pwBounds=bounds;
+  return {fn, params, pw:true};
+}
+function compile1(src, names, self){
   const s=preprocess(src);
   if(!s.trim()) throw new Error('Expression vide');
   const toks=tokenize(s); let i=0, absDepth=0;
@@ -220,6 +274,10 @@ function sampleFn(f,a,b,N){
     if(i===N&&!isFinite(b)) t=1-0.5/N;
     const x=map(t); xs.push(x); ys.push(safe(f,x));
   }
+  // dépassement de capacité (ex. e^(−x) pour x < −709) : ce n'est pas un trou du domaine
+  const OV=25;
+  if(!isFinite(b)){ let i=N; while(i>0&&!isFinite(ys[i])) i--; if(i<N&&i>0&&xs[i]>=OV) for(let j=i+1;j<=N;j++) ys[j]=ys[i]; }
+  if(!isFinite(a)){ let k=0; while(k<N&&!isFinite(ys[k])) k++; if(k>0&&k<N&&xs[k]<=-OV) for(let j=0;j<k;j++) ys[j]=ys[k]; }
   return {xs,ys};
 }
 function snapQ(x){ if(!isFinite(x)) return x;
@@ -307,7 +365,11 @@ function limitSide(f,a,side){
 function limitInf(f,sgn){
   const vals=[];
   for(let k=1;k<=10;k++){ const x=sgn*Math.pow(10,k); vals.push([x,safe(f,x)]); }
-  return {vals, L:estimate(vals.map(p=>p[1]))};
+  let L=estimate(vals.map(p=>p[1]));
+  if(vals.some(p=>!isFinite(p[1]))){ // dépassement de capacité (exponentielles) : on refait avec x = 2, 4, …, 512
+    const v2=[]; for(let k=1;k<=9;k++){ const x=sgn*Math.pow(2,k); v2.push([x,safe(f,x)]); }
+    const L2=estimate(v2.map(p=>p[1])); if(!Number.isNaN(L2)) return {vals:v2,L:L2}; }
+  return {vals, L};
 }
 function simpson(f,a,b,n=2000){
   const h=(b-a)/n; let s=f(a)+f(b);
@@ -376,7 +438,7 @@ function shortX(v){ if(!isFinite(v)) return fmt(v); if(Math.abs(v-Math.round(v))
 
 /* ---------------- Langue (FR / EN) ---------------- */
 let LANG='fr'; try{ LANG=localStorage.getItem('kampyli-lang')||'fr'; }catch(e){}
-const EN_PAIRS=[["Tapez une fonction, elle se trace. Outils pour l'étude de fonction : limites, dérivée, variations, tangente…", "Type a function, it gets plotted. Tools for studying functions: limits, derivative, variations, tangent…"], ["étude de fonctions", "function study"], ["Exemples…", "Examples…"], ["+ Ajouter une fonction", "+ Add a function"], ["Fonctions", "Functions"], ["Curseurs", "Sliders"], ["Étude de fonction", "Function study"], ["Comment écrire une fonction", "How to type a function"], ["Sauvegarde", "Saving"], ["Le travail est gardé automatiquement dans ce navigateur. Pour le partager ou le retrouver ailleurs, copiez son code.", "Your work is saved automatically in this browser. To share it or open it elsewhere, copy its code."], ["Copier le code", "Copy code"], ["Charger un code", "Load a code"], ["Tout effacer", "Clear all"], ["Collez le code ici", "Paste the code here"], ["Charger", "Load"], ["Zoom avant", "Zoom in"], ["Zoom arrière", "Zoom out"], ["Ajuster l'axe des ordonnées à la courbe", "Fit the y-axis to the curve"], ["Ajuster y", "Fit y"], ["Fenêtre standard", "Standard window"], ["Standard", "Standard"], ["Repère orthonormé", "Orthonormal axes"], ["Orthonormé", "Orthonormal"], ["Tracer les asymptotes de toutes les courbes", "Draw the asymptotes of all curves"], ["Graduations en multiples de π", "Graduations in multiples of π"], ["Plein écran (projection)", "Full screen (projector)"], ["Afficher / masquer", "Show / hide"], ["Supprimer", "Delete"], ["restriction", "restriction"], ["Trinôme ax² + bx + c", "Quadratic ax² + bx + c"], ["ⁿ√x avec curseur n", "ⁿ√x with slider n"], ["x² (à restreindre pour f⁻¹)", "x² (restrict it for f⁻¹)"], ["x⁴ − 2x² (étude complète)", "x⁴ − 2x² (full study)"], ["x³ − 3x² + 2 (inflexion)", "x³ − 3x² + 2 (inflection)"], ["x²/(x − 1) (asymptote oblique)", "x²/(x − 1) (oblique asymptote)"], ["|x² − 1| (points anguleux)", "|x² − 1| (corner points)"], ["E(x) partie entière", "E(x) floor function"], ["puissance rationnelle, définie pour x > 0 (x ≥ 0)", "rational power, defined for x > 0 (x ≥ 0)"], ["puissance", "power"], ["produit implicite", "implicit product"], ["décimaux", "decimals"], ["valeur absolue", "absolute value"], ["racine carrée", "square root"], ["racine n-ième, définie sur [0 ; +∞[ comme au programme ;", "n-th root, defined on [0 ; +∞[ as in the curriculum;"], ["avec n entier ≥ 1 (n peut être un curseur)", "with integer n ≥ 1 (n can be a slider)"], ["log népérien, décimal, exponentielle", "natural log, base-10 log, exponential"], ["en radians ;", "in radians;"], ["partie entière : E(x) ≤ x < E(x) + 1. Aux sauts, ● = valeur atteinte, ○ = valeur non atteinte", "floor function: E(x) ≤ x < E(x) + 1. At jumps, ● = value reached, ○ = value not reached"], ["séparateur d'arguments : « ; »", "argument separator: « ; »"], ["toute autre lettre crée un curseur", "any other letter creates a slider"], ["réutiliser une autre fonction ou sa dérivée", "reuse another function or its derivative"], ["Dérivée, intégrale, zéros, extremums et limites sont calculés numériquement : très précis pour les fonctions du programme, mais à confirmer par le calcul. La « valeur exacte probable » (étiquette verte) est une reconnaissance automatique, pas une preuve.", "Derivative, integral, zeros, extrema and limits are computed numerically: very accurate for curriculum functions, but to be confirmed by calculation. The « likely exact value » (green label) is an automatic recognition, not a proof."], ["Valeur exacte probable", "Likely exact value"], ["Restriction de", "Restriction of"], ["x initial et x final (vide = −∞ / +∞). Cliquez sur un crochet pour l'ouvrir ou le fermer.", "start x and end x (empty = −∞ / +∞). Click a bracket to open or close it."], ["Étude complète", "Full study"], ["Opérations", "Operations"], ["Dérivabilité", "Differentiability"], ["Branches infinies", "Infinite branches"], ["Zéros & extremums", "Zeros & extrema"], ["Tableau de valeurs", "Table of values"], ["Réciproque", "Inverse"], ["Intégrale / aire", "Integral / area"], ["Variations", "Variations"], ["Tangente", "Tangent"], ["Limite", "Limit"], ["Dérivée", "Derivative"], ["Fonction étudiée", "Function studied"], ["Fonction", "Function"], ["Opération", "Operation"], ["+  somme", "+  sum"], ["−  différence", "−  difference"], ["×  produit", "×  product"], ["÷  quotient", "÷  quotient"], ["λ·f (multiple)", "λ·f (multiple)"], ["λ (pour λ·f)", "λ (for λ·f)"], ["Créer la fonction résultat", "Create the resulting function"], ["Ensembles de définition", "Domains"], ["Le signe de", "The sign of"], ["(x) donne la position relative de 𝒞", "(x) gives the relative position of 𝒞"], ["(outil « Étude complète » sur la fonction créée).", "(« Full study » tool on the created function)."], ["Aperçu en pointillés noirs sur le graphique. Le bouton crée la fonction, qu'on peut ensuite étudier avec tous les outils.", "Preview as a black dotted curve. The button creates the function, which can then be studied with every tool."], ["Ajoutez une deuxième fonction (bouton « + Ajouter une fonction ») pour combiner f et g.", "Add a second function (« + Add a function » button) to combine f and g."], ["ne s'annule pas.", "never vanishes."], ["Choisissez des fonctions valides", "Choose valid functions"], ["Saisissez d'abord une fonction valide.", "First type a valid function."], ["Étude sur l'ensemble de définition de f (restriction comprise). On peut limiter l'étude à un intervalle :", "Study on the domain of f (restriction included). You can limit the study to an interval:"], ["De", "From"], ["À", "To"], ["Trop de points remarquables sur ℝ : étude limitée à la fenêtre [", "Too many notable points on ℝ: study limited to the window ["], ["] (modifiable ci-dessus).", "] (editable above)."], ["est périodique de période", "is periodic with period"], [": étude sur [", ": study on ["], ["1. Ensemble de définition", "1. Domain"], ["(est restreinte par l'utilisateur.)", "(restricted by the user.)"], ["est restreinte par l'utilisateur.)", "is restricted by the user.)"], ["2. Parité, périodicité", "2. Parity, periodicity"], ["D n'est pas symétrique par rapport à 0 : f n'est ni paire ni impaire.", "D is not symmetric about 0: f is neither even nor odd."], ["f est à la fois paire et impaire (f = 0).", "f is both even and odd (f = 0)."], ["Pour tout x de D : −x ∈ D et f(−x) = f(x) ⇒ f est", "For every x in D: −x ∈ D and f(−x) = f(x) ⇒ f is"], ["Pour tout x de D : −x ∈ D et f(−x) = −f(x) ⇒ f est", "For every x in D: −x ∈ D and f(−x) = −f(x) ⇒ f is"], [": 𝒞f est symétrique par rapport à l'axe (Oy).", ": 𝒞f is symmetric about the axis (Oy)."], [": 𝒞f est symétrique par rapport à l'origine O.", ": 𝒞f is symmetric about the origin O."], ["n'est ni paire ni impaire.", "is neither even nor odd."], ["paire", "even"], ["impaire", "odd"], ["est périodique de période T =", "is periodic with period T ="], [": on peut l'étudier sur un intervalle de longueur", ": it can be studied on an interval of length"], ["3. Limites aux bornes et branches infinies", "3. Limits at the boundaries and infinite branches"], ["4. Continuité et dérivabilité", "4. Continuity and differentiability"], ["5. Sens de variation", "5. Variations"], ["6. Extremums", "6. Extrema"], ["7. Convexité et points d'inflexion", "7. Convexity and inflection points"], ["8. Intersections avec les axes", "8. Intersections with the axes"], ["9. Bijection et fonction réciproque", "9. Bijection and inverse function"], ["Résultats obtenus numériquement : chaque point est à démontrer par le calcul.", "Results obtained numerically: each point must be proven by calculation."], ["est continue sur chaque intervalle de D.", "is continuous on each interval of D."], ["(sauts : limites à gauche et à droite différentes). Elle est continue sur chacun des intervalles entre ces points.", "(jumps: different left and right limits). It is continuous on each interval between these points."], ["n'est pas continue en x =", "is not continuous at x ="], ["est dérivable en tout point intérieur de D (aucun point anguleux détecté).", "is differentiable at every interior point of D (no corner point detected)."], [": taux d'accroissement →", ": difference quotient →"], ["à gauche,", "on the left,"], ["à droite ⇒", "on the right ⇒"], ["(deux demi-tangentes).", "(two half-tangents)."], ["demi-tangente(s) verticale(s)", "vertical half-tangent(s)"], ["(borne) : lim (", "(boundary): lim ("], ["(borne) :", "(boundary):"], ["est dérivable à droite, nombre dérivé", "is right-differentiable, derivative"], ["est dérivable à gauche, nombre dérivé", "is left-differentiable, derivative"], [", nombre dérivé", ", derivative"], ["Minimum local", "Local minimum"], ["Maximum local", "Local maximum"], ["′ s'annule en changeant de signe en", "′ vanishes and changes sign at"], ["⇒ <b>tangente horizontale</b>", "⇒ horizontal tangent"], ["tangente horizontale d'équation", "horizontal tangent with equation"], ["(point anguleux) ⇒ pas de tangente horizontale.", "(corner point) ⇒ no horizontal tangent."], ["Aucun extremum local.", "No local extremum."], ["Aucun point d'inflexion.", "No inflection point."], ["Point d'inflexion", "Inflection point"], ["″ s'annule en changeant de signe ; tangente d'inflexion", "″ vanishes and changes sign; inflection tangent"], ["est convexe", "is convex"], ["est concave", "is concave"], ["convexe", "convex"], ["concave", "concave"], ["Sur ]", "On ]"], ["Avec (Ox) :", "With (Ox):"], ["Avec (Oy) :", "With (Oy):"], ["aucune (0 ∉ D)", "none (0 ∉ D)"], ["aucune", "none"], ["est continue et strictement croissante sur", "is continuous and strictly increasing on"], ["est continue et strictement décroissante sur", "is continuous and strictly decreasing on"], ["réalise une bijection de", "is a bijection from"], ["⇒ f réalise une", "⇒ f is a"], ["Sa réciproque", "Its inverse"], ["⁻¹ est définie sur J ; 𝒞", "⁻¹ is defined on J; 𝒞"], ["⁻¹ est la symétrique de 𝒞", "⁻¹ is the reflection of 𝒞"], ["par rapport à y = x (bouton", "in the line y = x (button"], ["n'est pas strictement monotone sur un intervalle unique : elle n'admet pas de réciproque sur D.", "is not strictly monotonic on a single interval: it has no inverse on D."], ["Restriction possible à un intervalle de monotonie :", "Possible restriction to an interval of monotonicity:"], ["restreinte à", "restricted to"], [": strictement croissante, bijection sur", ": strictly increasing, bijection onto"], [": strictement décroissante, bijection sur", ": strictly decreasing, bijection onto"], [": la courbe de", ": the curve of"], ["⁻¹ est tracée", "⁻¹ is drawn"], ["strictement croissante", "strictly increasing"], ["strictement décroissante", "strictly decreasing"], ["croissante", "increasing"], ["décroissante", "decreasing"], ["bijection", "bijection"], ["sur J =", "onto J ="], ["(bornes à adapter si ouvertes).", "(adjust brackets if open)."], ["Étudier la dérivabilité en a =", "Study differentiability at a ="], ["Faites glisser le point sur la courbe. Exemples : √x en 0, |x² − 1| en 1, x·|x| en 0, ∛x en 0.", "Drag the point along the curve. Examples: √x at 0, |x² − 1| at 1, x·|x| at 0, ∛x at 0."], ["n'est pas définie en", "is not defined at"], [": la question de la dérivabilité ne se pose pas.", ": differentiability is not relevant there."], ["n'est pas continue à droite en", "is not right-continuous at"], ["n'est pas continue à gauche en", "is not left-continuous at"], ["(limite", "(limit"], [") : elle n'y est donc pas dérivable.", "): so it is not differentiable there."], ["′g(", "′l("], ["′d(", "′r("], ["est dérivable en", "is differentiable at"], ["admet en A(", "has at A("], [") une", ") a"], ["tangente horizontale", "horizontal tangent"], ["tangente verticale", "vertical tangent"], ["d'équation", "with equation"], [": tangente", ": tangent"], ["Le point A(", "The point A("], [") est un", ") is a"], ["point anguleux", "corner point"], ["de 𝒞", "of 𝒞"], ["est dérivable à droite en", "is right-differentiable at"], ["est dérivable à gauche en", "is left-differentiable at"], [": demi-tangente à droite d'équation", ": right half-tangent with equation"], [": demi-tangente à gauche d'équation", ": left half-tangent with equation"], ["n'est pas dérivable à droite en", "is not right-differentiable at"], ["n'est pas dérivable à gauche en", "is not left-differentiable at"], [": 𝒞", ": 𝒞"], ["admet une", "has a"], ["demi-tangente verticale", "vertical half-tangent"], ["à droite, dirigée vers le", "on the right, pointing"], ["à gauche, dirigée vers le", "on the left, pointing"], [", dirigée vers le", ", pointing"], ["haut", "up"], ["bas", "down"], ["Pas de limite à droite : pas de demi-tangente à droite.", "No limit on the right: no right half-tangent."], ["Pas de limite à gauche : pas de demi-tangente à gauche.", "No limit on the left: no left half-tangent."], ["n'est définie qu'à droite de", "is only defined to the right of"], ["n'est définie qu'à gauche de", "is only defined to the left of"], ["n'est pas dérivable en", "is not differentiable at"], ["Symétrie par rapport à y = x", "Symmetry in the line y = x"], ["⁻¹ admet en A′ une", "⁻¹ has at A′ a"], ["⁻¹ n'est pas dérivable en", "⁻¹ is not differentiable at"], ["; tangente à 𝒞", "; tangent to 𝒞"], ["⁻¹ en A′ :", "⁻¹ at A′:"], ["demi-tangente à droite horizontale de 𝒞", "horizontal right half-tangent of 𝒞"], ["demi-tangente à gauche horizontale de 𝒞", "horizontal left half-tangent of 𝒞"], ["→ demi-tangente de pente", "→ half-tangent with slope"], ["demi-tangente de pente", "half-tangent with slope"], ["→ demi-tangente", "→ half-tangent"], ["pour 𝒞", "for 𝒞"], ["en A′", "at A′"], ["demi-tangente verticale de 𝒞", "vertical half-tangent of 𝒞"], ["⁻¹ y a un nombre dérivé nul d'un côté).", "⁻¹ has a zero one-sided derivative there)."], ["est un point anguleux de 𝒞", "is a corner point of 𝒞"], ["Étude en +∞ et en −∞, et recherche des asymptotes verticales sur l'intervalle :", "Study at +∞ and −∞, and search for vertical asymptotes on the interval:"], ["n'est pas définie au voisinage de", "is not defined near"], ["Pas de limite en", "No limit at"], [": pas de branche infinie.", ": no infinite branch."], ["Pas de limite : pas de conclusion.", "No limit: no conclusion."], ["⇒ La droite d'équation", "⇒ The line with equation"], ["est asymptote horizontale à 𝒞", "is a horizontal asymptote to 𝒞"], ["est asymptote oblique à 𝒞", "is an oblique asymptote to 𝒞"], ["est asymptote verticale à 𝒞", "is a vertical asymptote to 𝒞"], ["asymptote horizontale", "a horizontal asymptote"], ["asymptote oblique", "an oblique asymptote"], ["au voisinage de", "near"], ["est au-dessus", "is above"], ["est au-dessous", "is below"], ["de l'asymptote", "the asymptote"], ["branche parabolique de direction l'axe des ordonnées", "parabolic branch in the direction of the y-axis"], ["branche parabolique de direction l'axe des abscisses", "parabolic branch in the direction of the x-axis"], ["branche parabolique de direction la droite y =", "parabolic branch in the direction of the line y ="], ["Asymptotes verticales", "Vertical asymptotes"], ["Aucune trouvée.", "None found."], ["⇒ la droite", "⇒ the line"], ["Calcul numérique : la démonstration reste à faire par le calcul des limites.", "Numerical computation: the proof must be done by computing the limits."], ["B.P. de direction", "P.B. direction"], ["La droite d'équation x =", "The line x ="], ["Calculer en a =", "Compute at a ="], ["Tracer la courbe de f′ (pointillés)", "Draw the curve of f′ (dotted)"], ["Ajouter f′ comme nouvelle fonction", "Add f′ as a new function"], ["′(x) ajoutée", "′(x) added"], ["Dérivées à gauche (≈", "Left derivative (≈"], [") et à droite (≈", ") and right derivative (≈"], [") différentes :", ") differ:"], ["n'est pas dérivable en", "is not differentiable at"], ["(point anguleux).", "(corner point)."], [") n'est pas calculable : demi-tangente verticale ou point hors du domaine.", ") cannot be computed: vertical half-tangent or point outside the domain."], ["Abscisse a du point de contact", "x-coordinate a of the point of contact"], ["Astuce : faites glisser le point sur la courbe.", "Tip: drag the point along the curve."], ["ne semble pas dérivable en", "does not seem differentiable at"], ["soit", "i.e."], ["Début", "Start"], ["Pas", "Step"], ["Lignes", "Rows"], ["Copier le tableau", "Copy the table"], ["Tableau copié (collable dans un tableur)", "Table copied (paste it into a spreadsheet)"], ["non déf.", "undef."], ["Borne gauche", "Left bound"], ["Borne droite", "Right bound"], ["fenêtre", "window"], ["Vide = fenêtre visible. On peut écrire π/2, -inf, +inf…", "Empty = visible window. You can type π/2, -inf, +inf…"], ["Intervalle invalide.", "Invalid interval."], ["Intervalle d'étude invalide.", "Invalid study interval."], ["Zéros de", "Zeros of"], ["Aucun zéro trouvé.", "No zero found."], ["Extremums locaux", "Local extrema"], ["Aucun extremum local trouvé.", "No local extremum found."], ["Maximum", "Maximum"], ["Minimum", "Minimum"], ["(tangente horizontale)", "(horizontal tangent)"], ["(point anguleux)", "(corner point)"], ["en x =", "at x ="], ["x tend vers", "x tends to"], [": pas de limite détectée (oscillation ou calcul instable)", ": no limit detected (oscillation or unstable computation)"], ["est continue en", "is continuous at"], ["≠ limite :", "≠ limit:"], ["n'est pas continue en", "is not continuous at"], ["mais y admet une limite finie (prolongement par continuité possible).", "but has a finite limit there (continuous extension possible)."], ["n'est pas définie en", "is not defined at"], ["Limites à gauche et à droite différentes : pas de limite en", "Different left and right limits: no limit at"], ["est asymptote verticale à 𝒞", "is a vertical asymptote to 𝒞"], ["Valeur k", "Value k"], ["Faites glisser la droite y = k.", "Drag the line y = k."], ["Équation", "Equation"], ["solutions", "solutions"], ["solution", "solution"], ["Aucune solution trouvée sur cet intervalle.", "No solution found on this interval."], ["Tableau obtenu numériquement sur [", "Table obtained numerically on ["], ["] : à justifier par l'étude du signe de", "]: to be justified by studying the sign of"], ["n'est définie nulle part sur cet intervalle.", "is defined nowhere on this interval."], ["Borne a", "Bound a"], ["Borne b", "Bound b"], ["Entre la courbe et", "Between the curve and"], ["l'axe des abscisses", "the x-axis"], ["‖i‖ en cm", "‖i‖ in cm"], ["‖j‖ en cm", "‖j‖ in cm"], ["optionnel", "optional"], ["Bornes finies requises.", "Finite bounds required."], ["La fonction n'est pas définie (ou pas bornée) sur tout [", "The function is not defined (or not bounded) on all of ["], ["] : intégrale non calculable ici.", "]: integral cannot be computed here."], ["Aire du domaine coloré :", "Area of the shaded region:"], ["u.a.", "a.u."], ["cm², soit", "cm², i.e."], ["La fonction change de signe sur l'intervalle : l'intégrale et l'aire diffèrent.", "The function changes sign on the interval: integral and area differ."], ["Tracer la courbe de f⁻¹ (symétrique par rapport à y = x)", "Draw the curve of f⁻¹ (reflection in y = x)"], ["Restreignez l'intervalle à une zone où f est bijective (ex. tan sur ]−π/2 ; π/2[ : −pi/2 et pi/2) : seule cette partie est symétrisée.", "Restrict the interval to a region where f is bijective (e.g. tan on ]−π/2 ; π/2[: −pi/2 and pi/2): only that part is reflected."], ["Calculer (f⁻¹)′(b) pour b =", "Compute (f⁻¹)′(b) for b ="], ["réalise une bijection sur J = [", "is a bijection onto J = ["], ["] : elle réalise une bijection sur J = [", "]: it is a bijection onto J = ["], ["n'est pas strictement monotone (ou pas continue) sur cet intervalle : la courbe symétrique n'y est pas celle d'une fonction réciproque.", "is not strictly monotonic (or not continuous) on this interval: the reflected curve there is not that of an inverse function."], ["′ s'annule en ce point :", "′ vanishes at this point:"], ["⁻¹ n'y est pas dérivable (tangente verticale).", "⁻¹ is not differentiable there (vertical tangent)."], ["n'a pas d'antécédent sur l'intervalle.", "has no preimage on the interval."], ["antécédents : restreignez l'intervalle.", "preimages: restrict the interval."], ["n'est pas continue et strictement monotone sur un intervalle : pas de fonction réciproque. Restreignez", "is not continuous and strictly monotonic on an interval: no inverse function. Restrict"], ["(x initial ; x final) — voir « Étude complète ».", "(start x ; end x) — see « Full study »."], ["Courbe de", "Curve of"], ["⁻¹ : c'est la courbe d'une fonction seulement si", "⁻¹: it is the curve of a function only if"], ["est bijective (voir l'outil Réciproque)", "is bijective (see the Inverse tool)"], ["Tracer la courbe de", "Draw the curve of"], ["(symétrique par rapport à y = x)", "(reflection in y = x)"], ["Expression incomplète", "Incomplete expression"], ["Expression vide", "Empty expression"], ["Parenthèse fermante manquante", "Missing closing parenthesis"], ["Barre de valeur absolue manquante", "Missing absolute value bar"], ["» attendu", "» expected"], ["Symbole inattendu «", "Unexpected symbol «"], ["Caractère non reconnu : «", "Unrecognized character: «"], ["Nombre mal écrit", "Badly written number"], ["attend un seul argument", "expects a single argument"], ["racine : un seul argument attendu", "root: a single argument expected"], ["Écrire rac(n ; x), par ex. rac(3 ; x)", "Write rac(n ; x), e.g. rac(3 ; x)"], ["ne peut pas s'utiliser elle-même", "cannot use itself"], ["n'est pas une fonction définie", "is not a defined function"], ["Borne de restriction invalide", "Invalid restriction bound"], ["Restriction : il faut x initial < x final", "Restriction: start x must be < end x"], ["8 fonctions au maximum", "8 functions at most"], ["Code copié : collez-le dans « Charger un code »", "Code copied: paste it into « Load a code »"], ["Code invalide", "Invalid code"], ["Travail chargé", "Work loaded"], ["Nouveau travail", "New work"], ["Copie impossible", "Copy failed"], ["Plein écran indisponible ici", "Full screen unavailable here"], ["Aucune fonction", "No function"], ["Calcul impossible.", "Computation failed."], ["créée", "created"], ["Étude de fonctions", "Function study"], ["Kampyli — Étude de fonctions", "Kampyli — Function study"], ["La suite semble converger vers", "The sequence seems to converge to"], ["⇒ <b>tangente horizontale</b>", "⇒ horizontal tangent"], ["tangente d'inflexion", "inflection tangent"], ["Aucune racine réelle.", "No real root."], ["(multiplicité", "(multiplicity"], ["est la symétrique de", "is the reflection of"], ["est définie sur", "is defined on"], ["asymptote verticale", "a vertical asymptote"], ["au-dessus", "above"], ["au-dessous", "below"], ["strictement", "strictly"], ["continue", "continuous"], ["définie", "defined"], ["de [", "from ["], ["de ]", "from ]"], ["En", "At"], ["est", "is"], ["et", "and"], ["sur", "on"], ["à", "to"], ["de", "of"], ["en", "at"], ["la", "the"], ["le", "the"], ["les", "the"], ["une", "a"], ["un", "a"], ["ou", "or"], ["pour", "for"], ["avec", "with"], ["dans", "in"], ["si", "if"], ["Ou bien : point de 𝒞f⁻¹ d'abscisse b", "Or: point of 𝒞f⁻¹ with x-coordinate b"], ["Si le bouton f⁻¹ est actif : tangente à 𝒞f⁻¹ au point B(b ; f⁻¹(b)).", "If the f⁻¹ button is on: tangent to 𝒞f⁻¹ at B(b ; f⁻¹(b))."], ["Pour un point de 𝒞", "For a point of 𝒞"], [", activez le bouton", ", turn on the button"], ["strictement monotone, au besoin restreinte).", "strictly monotonic, restricted if needed)."], ["n'a pas d'antécédent unique par", "has no unique preimage under"], ["a une", "has a"], ["Tangentes de 𝒞", "Tangents of 𝒞"], ["(symétriques par rapport à y = x, en violet)", "(reflections in y = x, in purple)"], ["tangente à 𝒞", "tangent to 𝒞"], ["de pente 1/", "with slope 1/"], ["demi-tangente horizontale", "horizontal half-tangent"], ["demi-tangente verticale pour 𝒞", "vertical half-tangent for 𝒞"], ["demi-tangente horizontale de 𝒞", "horizontal half-tangent of 𝒞"], ["d'un côté.", "on one side."], ["Aucun point particulier : en tout point (", "No special point: at every point ("], ["de pente", "with slope"], ["Homographique", "Homographic"], ["Homographique (ax + b)/(cx + d)", "Homographic (ax + b)/(cx + d)"], ["f(x) = (ax + b) / (cx + d), avec c ≠ 0 et ad − bc ≠ 0", "f(x) = (ax + b) / (cx + d), with c ≠ 0 and ad − bc ≠ 0"], ["Tracer cette fonction", "Plot this function"], ["Tracer avec curseurs a, b, c, d", "Plot with sliders a, b, c, d"], ["Coefficients invalides", "Invalid coefficients"], ["c = 0 : f est une fonction affine, f(x) =", "c = 0: f is an affine function, f(x) ="], ["(non définie : d = 0)", "(undefined: d = 0)"], ["ad − bc = 0 : f est constante, égale à", "ad − bc = 0: f is constant, equal to"], ["(ce n'est pas une vraie fonction homographique).", "(not a true homographic function)."], ["Ensemble de définition", "Domain"], ["Déterminant", "Determinant"], ["Forme réduite", "Reduced form"], ["verticale x =", "vertical x ="], ["horizontale y =", "horizontal y ="], ["Centre de symétrie", "Centre of symmetry"], ["point d'intersection des asymptotes.", "intersection point of the asymptotes."], ["est une", "is a"], ["hyperbole", "hyperbola"], [": image de la courbe de x ↦", ": image of the curve of x ↦"], ["par la translation de vecteur OΩ.", "under the translation by vector OΩ."], ["Aperçu en noir : courbe, asymptotes et centre Ω. Les boutons ajoutent f à la liste des fonctions.", "Black preview: curve, asymptotes and centre Ω. The buttons add f to the function list."], ["sur ℝ \\ {", "on ℝ \\ {"], ["et sur", "and on"], ["Asymptotes", "Asymptotes"], ["−f, f(|x|), |f|", "−f, f(|x|), |f|"], ["Symétries", "Symmetries"], ["Transformation", "Transformation"], ["Créer cette fonction", "Create this function"], ["est la", "is the"], ["symétrique de 𝒞", "reflection of 𝒞"], ["par rapport à l'axe des abscisses (Ox)", "in the x-axis (Ox)"], ["par rapport à l'axe des ordonnées (Oy)", "in the y-axis (Oy)"], ["par rapport à l'origine O", "about the origin O"], ["Pour x ≥ 0 : g(x) =", "For x ≥ 0: g(x) ="], ["⇒ on", "⇒ we"], ["garde la partie de 𝒞", "keep the part of 𝒞"], ["située à droite de (Oy)", "to the right of (Oy)"], ["g est", "g is"], ["⇒ on complète par", "⇒ complete it by"], ["symétrie par rapport à (Oy)", "reflection in (Oy)"], ["(La partie de 𝒞", "(The part of 𝒞"], ["à gauche de (Oy) disparaît.)", "to the left of (Oy) disappears.)"], ["Là où", "Where"], ["et 𝒞", "and 𝒞"], ["sont confondues.", "coincide."], ["⇒ on remplace cette partie par sa", "⇒ replace this part by its"], ["symétrique par rapport à (Ox)", "reflection in (Ox)"], ["Changements de signe aux zéros de", "Sign changes at the zeros of"], ["(points anguleux possibles de 𝒞g).", "(possible corner points of 𝒞g)."], ["Aperçu de 𝒞g en noir. Le bouton ajoute g à la liste pour l'étudier.", "Black preview of 𝒞g. The button adds g to the list for study."], ["Recherche automatique des axes et centres de symétrie de 𝒞f. Pour vérifier un élément précis :", "Automatic search for axes and centres of symmetry of 𝒞f. To check a specific element:"], ["b (centre)", "b (centre)"], ["vide = axe", "empty = axis"], ["a seul : teste l'axe x = a. a et b : teste le centre Ω(a ; b).", "a alone: tests the axis x = a. a and b: tests the centre Ω(a ; b)."], ["Éléments de symétrie détectés", "Detected symmetry elements"], ["est un", "is an"], ["axe de symétrie", "axis of symmetry"], ["centre de symétrie", "centre of symmetry"], ["pour tout x de D,", "for every x in D,"], ["Aucun axe ni centre de symétrie détecté.", "No axis or centre of symmetry detected."], ["est constante : toute droite verticale est axe de symétrie.", "is constant: every vertical line is an axis of symmetry."], ["Vérification :", "Check:"], ["axe de symétrie ?", "axis of symmetry?"], ["centre de symétrie ?", "centre of symmetry?"], ["Condition : pour tout x de D,", "Condition: for every x in D,"], ["Vrai", "True"], ["(vérifié numériquement) : la droite x =", "(checked numerically): the line x ="], ["(vérifié numériquement) : Ω est un", "(checked numerically): Ω is a"], ["Faux", "False"], [": par exemple pour x =", ": for example for x ="], ["Recherche numérique : à démontrer avec la condition ci-dessus.", "Numerical search: to be proven with the condition above."], ["2. Parité, périodicité, symétries", "2. Parity, periodicity, symmetries"], ["axe x =", "axis x ="], ["x² − 4x + 1 (axe de symétrie)", "x² − 4x + 1 (axis of symmetry)"], ["x³ − 3x² + 2 (centre de symétrie)", "x³ − 3x² + 2 (centre of symmetry)"], ["ex. 1", "e.g. 1"], ["étant périodique de période", "being periodic with period"], [", ces éléments se répètent par translation : il y en a une infinité.", ", these elements repeat by translation: there are infinitely many."], ["La droite d'équation", "The line with equation"], ["La droite", "The line"], ["Tous droits réservés", "All rights reserved"], ["À propos", "About"], ["Fermer", "Close"], ["Version 1.0 · 2026", "Version 1.0 · 2026"], ["Application d'étude de fonctions pour le lycée : tracé de courbes, limites, dérivabilité, variations, convexité, branches infinies, symétries, fonction réciproque.", "Function study app for high school: curve plotting, limits, differentiability, variations, convexity, infinite branches, symmetries, inverse function."], ["Auteur :", "Author:"], ["Toute reproduction, modification ou diffusion de l'application, de son code, de son nom ou de son logo sans autorisation écrite de l'auteur est interdite.", "Any reproduction, modification or distribution of the app, its code, its name or its logo without the author's written permission is prohibited."], ["Les résultats sont obtenus par calcul numérique : ils servent à visualiser et vérifier, et doivent être démontrés par le calcul.", "Results are obtained by numerical computation: they help visualise and check, and must be proven by calculation."], ["Polices : IBM Plex Sans, IBM Plex Sans Arabic et IBM Plex Mono, © IBM Corp., sous licence SIL Open Font License 1.1.", "Fonts: IBM Plex Sans, IBM Plex Sans Arabic and IBM Plex Mono, © IBM Corp., under the SIL Open Font License 1.1."], ["⌨ Clavier", "⌨ Keyboard"], ["Clavier mathématique", "Math keyboard"], ["Fermer le clavier", "Close the keyboard"], ["Masquer / afficher le panneau", "Hide / show the panel"]];
+const EN_PAIRS=[["Numérateur", "Numerator"],["Dénominateur", "Denominator"],["PGCD et PPCM d'entiers (définis seulement pour des entiers : la courbe est alors tracée par points)", "GCD and LCM of integers (defined only for integers: the curve is then drawn as points)"],["Parcourir la courbe : un point se déplace sur la courbe", "Trace the curve: a point moves along the curve"],["Parcourir", "Trace"],["Changer de courbe", "Change curve"],["Reculer", "Back"],["Animer", "Animate"],["Avancer", "Forward"],["Arrêter le parcours", "Stop tracing"],["Fonction définie par morceaux (sur des intervalles)", "Piecewise-defined function (on intervals)"],["définie par morceaux : une expression et sa condition sur x par ligne (ex. x < 1 ; −1 ≤ x < 2 ; x = 0). Condition vide = « sinon ».", "defined piecewise: one expression and its condition on x per line (e.g. x < 1 ; −1 ≤ x < 2 ; x = 0). Empty condition = « otherwise »."],["+ morceau", "+ piece"],["Supprimer ce morceau", "Delete this piece"],["expression", "expression"],["sinon", "otherwise"],["Par morceaux : x² / 2x − 1", "Piecewise: x² / 2x − 1"],["Par morceaux : discontinuité en 0", "Piecewise: discontinuity at 0"],["Prolongement : sin(x)/x et f(0) = 1", "Extension: sin(x)/x and f(0) = 1"],["Par morceaux : x² / √x", "Piecewise: x² / √x"],["fonction définie par morceaux (bouton", "piecewise-defined function (button"],["; conditions :", "; conditions:"],["prolongement par continuité", "continuous extension"],["Condition mal écrite : «", "Badly written condition: «"],["Morceau sans expression", "Piece without expression"],["Condition manquante après « si »", "Missing condition after « if »"],["Photographier une fonction écrite et la taper automatiquement", "Take a photo of a written function and type it automatically"],["Scanner une fonction", "Scan a function"],["Scanner", "Scan"],["Encadrez la fonction (doigt ou souris), puis « Lire ». Une seule fonction, bien éclairée et nette.", "Frame the function (finger or mouse), then « Read ». One function, well lit and sharp."],["Autre photo", "Another photo"],["Tourner la photo", "Rotate the photo"],["Lire la fonction", "Read the function"],["Fonction lue — vérifiez et corrigez si besoin", "Function read — check and correct if needed"],["Préparation de la lecture (la première fois, cela peut prendre un moment)…", "Preparing the reader (the first time, this may take a moment)…"],["Lecture…", "Reading…"],["Lecture terminée : vérifiez le résultat (exposants, fractions, signes).", "Done: check the result (exponents, fractions, signs)."],["Aucun texte reconnu : recadrez plus serré ou reprenez la photo.", "No text recognized: crop tighter or take the photo again."],["La lecture nécessite une connexion Internet (la première fois). Réessayez une fois connecté.", "Reading needs an Internet connection (the first time). Try again once connected."],["✓ Expression valide", "✓ Valid expression"],["Image illisible", "Unreadable image"],["Tapez une fonction, elle se trace. Outils pour l'étude de fonction : limites, dérivée, variations, tangente…", "Type a function, it gets plotted. Tools for studying functions: limits, derivative, variations, tangent…"], ["étude de fonctions", "function study"], ["Exemples…", "Examples…"], ["+ Ajouter une fonction", "+ Add a function"], ["Fonctions", "Functions"], ["Curseurs", "Sliders"], ["Étude de fonction", "Function study"], ["Comment écrire une fonction", "How to type a function"], ["Sauvegarde", "Saving"], ["Le travail est gardé automatiquement dans ce navigateur. Pour le partager ou le retrouver ailleurs, copiez son code.", "Your work is saved automatically in this browser. To share it or open it elsewhere, copy its code."], ["Copier le code", "Copy code"], ["Charger un code", "Load a code"], ["Tout effacer", "Clear all"], ["Collez le code ici", "Paste the code here"], ["Charger", "Load"], ["Zoom avant", "Zoom in"], ["Zoom arrière", "Zoom out"], ["Ajuster l'axe des ordonnées à la courbe", "Fit the y-axis to the curve"], ["Ajuster y", "Fit y"], ["Fenêtre standard", "Standard window"], ["Standard", "Standard"], ["Repère orthonormé", "Orthonormal axes"], ["Orthonormé", "Orthonormal"], ["Tracer les asymptotes de toutes les courbes", "Draw the asymptotes of all curves"], ["Graduations en multiples de π", "Graduations in multiples of π"], ["Plein écran (projection)", "Full screen (projector)"], ["Afficher / masquer", "Show / hide"], ["Supprimer", "Delete"], ["restriction", "restriction"], ["Trinôme ax² + bx + c", "Quadratic ax² + bx + c"], ["ⁿ√x avec curseur n", "ⁿ√x with slider n"], ["x² (à restreindre pour f⁻¹)", "x² (restrict it for f⁻¹)"], ["x⁴ − 2x² (étude complète)", "x⁴ − 2x² (full study)"], ["x³ − 3x² + 2 (inflexion)", "x³ − 3x² + 2 (inflection)"], ["x²/(x − 1) (asymptote oblique)", "x²/(x − 1) (oblique asymptote)"], ["|x² − 1| (points anguleux)", "|x² − 1| (corner points)"], ["E(x) partie entière", "E(x) floor function"], ["puissance rationnelle, définie pour x > 0 (x ≥ 0)", "rational power, defined for x > 0 (x ≥ 0)"], ["puissance", "power"], ["produit implicite", "implicit product"], ["décimaux", "decimals"], ["valeur absolue", "absolute value"], ["racine carrée", "square root"], ["racine n-ième, définie sur [0 ; +∞[ comme au programme ;", "n-th root, defined on [0 ; +∞[ as in the curriculum;"], ["avec n entier ≥ 1 (n peut être un curseur)", "with integer n ≥ 1 (n can be a slider)"], ["log népérien, décimal, exponentielle", "natural log, base-10 log, exponential"], ["en radians ;", "in radians;"], ["partie entière : E(x) ≤ x < E(x) + 1. Aux sauts, ● = valeur atteinte, ○ = valeur non atteinte", "floor function: E(x) ≤ x < E(x) + 1. At jumps, ● = value reached, ○ = value not reached"], ["séparateur d'arguments : « ; »", "argument separator: « ; »"], ["toute autre lettre crée un curseur", "any other letter creates a slider"], ["réutiliser une autre fonction ou sa dérivée", "reuse another function or its derivative"], ["Dérivée, intégrale, zéros, extremums et limites sont calculés numériquement : très précis pour les fonctions du programme, mais à confirmer par le calcul. La « valeur exacte probable » (étiquette verte) est une reconnaissance automatique, pas une preuve.", "Derivative, integral, zeros, extrema and limits are computed numerically: very accurate for curriculum functions, but to be confirmed by calculation. The « likely exact value » (green label) is an automatic recognition, not a proof."], ["Valeur exacte probable", "Likely exact value"], ["Restriction de", "Restriction of"], ["x initial et x final (vide = −∞ / +∞). Cliquez sur un crochet pour l'ouvrir ou le fermer.", "start x and end x (empty = −∞ / +∞). Click a bracket to open or close it."], ["Étude complète", "Full study"], ["Opérations", "Operations"], ["Dérivabilité", "Differentiability"], ["Branches infinies", "Infinite branches"], ["Zéros & extremums", "Zeros & extrema"], ["Tableau de valeurs", "Table of values"], ["Réciproque", "Inverse"], ["Intégrale / aire", "Integral / area"], ["Variations", "Variations"], ["Tangente", "Tangent"], ["Limite", "Limit"], ["Dérivée", "Derivative"], ["Fonction étudiée", "Function studied"], ["Fonction", "Function"], ["Opération", "Operation"], ["+  somme", "+  sum"], ["−  différence", "−  difference"], ["×  produit", "×  product"], ["÷  quotient", "÷  quotient"], ["λ·f (multiple)", "λ·f (multiple)"], ["λ (pour λ·f)", "λ (for λ·f)"], ["Créer la fonction résultat", "Create the resulting function"], ["Ensembles de définition", "Domains"], ["Le signe de", "The sign of"], ["(x) donne la position relative de 𝒞", "(x) gives the relative position of 𝒞"], ["(outil « Étude complète » sur la fonction créée).", "(« Full study » tool on the created function)."], ["Aperçu en pointillés noirs sur le graphique. Le bouton crée la fonction, qu'on peut ensuite étudier avec tous les outils.", "Preview as a black dotted curve. The button creates the function, which can then be studied with every tool."], ["Ajoutez une deuxième fonction (bouton « + Ajouter une fonction ») pour combiner f et g.", "Add a second function (« + Add a function » button) to combine f and g."], ["ne s'annule pas.", "never vanishes."], ["Choisissez des fonctions valides", "Choose valid functions"], ["Saisissez d'abord une fonction valide.", "First type a valid function."], ["Étude sur l'ensemble de définition de f (restriction comprise). On peut limiter l'étude à un intervalle :", "Study on the domain of f (restriction included). You can limit the study to an interval:"], ["De", "From"], ["À", "To"], ["Trop de points remarquables sur ℝ : étude limitée à la fenêtre [", "Too many notable points on ℝ: study limited to the window ["], ["] (modifiable ci-dessus).", "] (editable above)."], ["est périodique de période", "is periodic with period"], [": étude sur [", ": study on ["], ["1. Ensemble de définition", "1. Domain"], ["(est restreinte par l'utilisateur.)", "(restricted by the user.)"], ["est restreinte par l'utilisateur.)", "is restricted by the user.)"], ["2. Parité, périodicité", "2. Parity, periodicity"], ["D n'est pas symétrique par rapport à 0 : f n'est ni paire ni impaire.", "D is not symmetric about 0: f is neither even nor odd."], ["f est à la fois paire et impaire (f = 0).", "f is both even and odd (f = 0)."], ["Pour tout x de D : −x ∈ D et f(−x) = f(x) ⇒ f est", "For every x in D: −x ∈ D and f(−x) = f(x) ⇒ f is"], ["Pour tout x de D : −x ∈ D et f(−x) = −f(x) ⇒ f est", "For every x in D: −x ∈ D and f(−x) = −f(x) ⇒ f is"], [": 𝒞f est symétrique par rapport à l'axe (Oy).", ": 𝒞f is symmetric about the axis (Oy)."], [": 𝒞f est symétrique par rapport à l'origine O.", ": 𝒞f is symmetric about the origin O."], ["n'est ni paire ni impaire.", "is neither even nor odd."], ["paire", "even"], ["impaire", "odd"], ["est périodique de période T =", "is periodic with period T ="], [": on peut l'étudier sur un intervalle de longueur", ": it can be studied on an interval of length"], ["3. Limites aux bornes et branches infinies", "3. Limits at the boundaries and infinite branches"], ["4. Continuité et dérivabilité", "4. Continuity and differentiability"], ["5. Sens de variation", "5. Variations"], ["6. Extremums", "6. Extrema"], ["7. Convexité et points d'inflexion", "7. Convexity and inflection points"], ["8. Intersections avec les axes", "8. Intersections with the axes"], ["9. Bijection et fonction réciproque", "9. Bijection and inverse function"], ["Résultats obtenus numériquement : chaque point est à démontrer par le calcul.", "Results obtained numerically: each point must be proven by calculation."], ["est continue sur chaque intervalle de D.", "is continuous on each interval of D."], ["(sauts : limites à gauche et à droite différentes). Elle est continue sur chacun des intervalles entre ces points.", "(jumps: different left and right limits). It is continuous on each interval between these points."], ["n'est pas continue en x =", "is not continuous at x ="], ["est dérivable en tout point intérieur de D (aucun point anguleux détecté).", "is differentiable at every interior point of D (no corner point detected)."], [": taux d'accroissement →", ": difference quotient →"], ["à gauche,", "on the left,"], ["à droite ⇒", "on the right ⇒"], ["(deux demi-tangentes).", "(two half-tangents)."], ["demi-tangente(s) verticale(s)", "vertical half-tangent(s)"], ["(borne) : lim (", "(boundary): lim ("], ["(borne) :", "(boundary):"], ["est dérivable à droite, nombre dérivé", "is right-differentiable, derivative"], ["est dérivable à gauche, nombre dérivé", "is left-differentiable, derivative"], [", nombre dérivé", ", derivative"], ["Minimum local", "Local minimum"], ["Maximum local", "Local maximum"], ["′ s'annule en changeant de signe en", "′ vanishes and changes sign at"], ["⇒ <b>tangente horizontale</b>", "⇒ horizontal tangent"], ["tangente horizontale d'équation", "horizontal tangent with equation"], ["(point anguleux) ⇒ pas de tangente horizontale.", "(corner point) ⇒ no horizontal tangent."], ["Aucun extremum local.", "No local extremum."], ["Aucun point d'inflexion.", "No inflection point."], ["Point d'inflexion", "Inflection point"], ["″ s'annule en changeant de signe ; tangente d'inflexion", "″ vanishes and changes sign; inflection tangent"], ["est convexe", "is convex"], ["est concave", "is concave"], ["convexe", "convex"], ["concave", "concave"], ["Sur ]", "On ]"], ["Avec (Ox) :", "With (Ox):"], ["Avec (Oy) :", "With (Oy):"], ["aucune (0 ∉ D)", "none (0 ∉ D)"], ["aucune", "none"], ["est continue et strictement croissante sur", "is continuous and strictly increasing on"], ["est continue et strictement décroissante sur", "is continuous and strictly decreasing on"], ["réalise une bijection de", "is a bijection from"], ["⇒ f réalise une", "⇒ f is a"], ["Sa réciproque", "Its inverse"], ["⁻¹ est définie sur J ; 𝒞", "⁻¹ is defined on J; 𝒞"], ["⁻¹ est la symétrique de 𝒞", "⁻¹ is the reflection of 𝒞"], ["par rapport à y = x (bouton", "in the line y = x (button"], ["n'est pas strictement monotone sur un intervalle unique : elle n'admet pas de réciproque sur D.", "is not strictly monotonic on a single interval: it has no inverse on D."], ["Restriction possible à un intervalle de monotonie :", "Possible restriction to an interval of monotonicity:"], ["restreinte à", "restricted to"], [": strictement croissante, bijection sur", ": strictly increasing, bijection onto"], [": strictement décroissante, bijection sur", ": strictly decreasing, bijection onto"], [": la courbe de", ": the curve of"], ["⁻¹ est tracée", "⁻¹ is drawn"], ["strictement croissante", "strictly increasing"], ["strictement décroissante", "strictly decreasing"], ["croissante", "increasing"], ["décroissante", "decreasing"], ["bijection", "bijection"], ["sur J =", "onto J ="], ["(bornes à adapter si ouvertes).", "(adjust brackets if open)."], ["Étudier la dérivabilité en a =", "Study differentiability at a ="], ["Faites glisser le point sur la courbe. Exemples : √x en 0, |x² − 1| en 1, x·|x| en 0, ∛x en 0.", "Drag the point along the curve. Examples: √x at 0, |x² − 1| at 1, x·|x| at 0, ∛x at 0."], ["n'est pas définie en", "is not defined at"], [": la question de la dérivabilité ne se pose pas.", ": differentiability is not relevant there."], ["n'est pas continue à droite en", "is not right-continuous at"], ["n'est pas continue à gauche en", "is not left-continuous at"], ["(limite", "(limit"], [") : elle n'y est donc pas dérivable.", "): so it is not differentiable there."], ["′g(", "′l("], ["′d(", "′r("], ["est dérivable en", "is differentiable at"], ["admet en A(", "has at A("], [") une", ") a"], ["tangente horizontale", "horizontal tangent"], ["tangente verticale", "vertical tangent"], ["d'équation", "with equation"], [": tangente", ": tangent"], ["Le point A(", "The point A("], [") est un", ") is a"], ["point anguleux", "corner point"], ["de 𝒞", "of 𝒞"], ["est dérivable à droite en", "is right-differentiable at"], ["est dérivable à gauche en", "is left-differentiable at"], [": demi-tangente à droite d'équation", ": right half-tangent with equation"], [": demi-tangente à gauche d'équation", ": left half-tangent with equation"], ["n'est pas dérivable à droite en", "is not right-differentiable at"], ["n'est pas dérivable à gauche en", "is not left-differentiable at"], [": 𝒞", ": 𝒞"], ["admet une", "has a"], ["demi-tangente verticale", "vertical half-tangent"], ["à droite, dirigée vers le", "on the right, pointing"], ["à gauche, dirigée vers le", "on the left, pointing"], [", dirigée vers le", ", pointing"], ["haut", "up"], ["bas", "down"], ["Pas de limite à droite : pas de demi-tangente à droite.", "No limit on the right: no right half-tangent."], ["Pas de limite à gauche : pas de demi-tangente à gauche.", "No limit on the left: no left half-tangent."], ["n'est définie qu'à droite de", "is only defined to the right of"], ["n'est définie qu'à gauche de", "is only defined to the left of"], ["n'est pas dérivable en", "is not differentiable at"], ["Symétrie par rapport à y = x", "Symmetry in the line y = x"], ["⁻¹ admet en A′ une", "⁻¹ has at A′ a"], ["⁻¹ n'est pas dérivable en", "⁻¹ is not differentiable at"], ["; tangente à 𝒞", "; tangent to 𝒞"], ["⁻¹ en A′ :", "⁻¹ at A′:"], ["demi-tangente à droite horizontale de 𝒞", "horizontal right half-tangent of 𝒞"], ["demi-tangente à gauche horizontale de 𝒞", "horizontal left half-tangent of 𝒞"], ["→ demi-tangente de pente", "→ half-tangent with slope"], ["demi-tangente de pente", "half-tangent with slope"], ["→ demi-tangente", "→ half-tangent"], ["pour 𝒞", "for 𝒞"], ["en A′", "at A′"], ["demi-tangente verticale de 𝒞", "vertical half-tangent of 𝒞"], ["⁻¹ y a un nombre dérivé nul d'un côté).", "⁻¹ has a zero one-sided derivative there)."], ["est un point anguleux de 𝒞", "is a corner point of 𝒞"], ["Étude en +∞ et en −∞, et recherche des asymptotes verticales sur l'intervalle :", "Study at +∞ and −∞, and search for vertical asymptotes on the interval:"], ["n'est pas définie au voisinage de", "is not defined near"], ["Pas de limite en", "No limit at"], [": pas de branche infinie.", ": no infinite branch."], ["Pas de limite : pas de conclusion.", "No limit: no conclusion."], ["⇒ La droite d'équation", "⇒ The line with equation"], ["est asymptote horizontale à 𝒞", "is a horizontal asymptote to 𝒞"], ["est asymptote oblique à 𝒞", "is an oblique asymptote to 𝒞"], ["est asymptote verticale à 𝒞", "is a vertical asymptote to 𝒞"], ["asymptote horizontale", "a horizontal asymptote"], ["asymptote oblique", "an oblique asymptote"], ["au voisinage de", "near"], ["est au-dessus", "is above"], ["est au-dessous", "is below"], ["de l'asymptote", "the asymptote"], ["branche parabolique de direction l'axe des ordonnées", "parabolic branch in the direction of the y-axis"], ["branche parabolique de direction l'axe des abscisses", "parabolic branch in the direction of the x-axis"], ["branche parabolique de direction la droite y =", "parabolic branch in the direction of the line y ="], ["Asymptotes verticales", "Vertical asymptotes"], ["Aucune trouvée.", "None found."], ["⇒ la droite", "⇒ the line"], ["Calcul numérique : la démonstration reste à faire par le calcul des limites.", "Numerical computation: the proof must be done by computing the limits."], ["B.P. de direction", "P.B. direction"], ["La droite d'équation x =", "The line x ="], ["Calculer en a =", "Compute at a ="], ["Tracer la courbe de f′ (pointillés)", "Draw the curve of f′ (dotted)"], ["Ajouter f′ comme nouvelle fonction", "Add f′ as a new function"], ["′(x) ajoutée", "′(x) added"], ["Dérivées à gauche (≈", "Left derivative (≈"], [") et à droite (≈", ") and right derivative (≈"], [") différentes :", ") differ:"], ["n'est pas dérivable en", "is not differentiable at"], ["(point anguleux).", "(corner point)."], [") n'est pas calculable : demi-tangente verticale ou point hors du domaine.", ") cannot be computed: vertical half-tangent or point outside the domain."], ["Abscisse a du point de contact", "x-coordinate a of the point of contact"], ["Astuce : faites glisser le point sur la courbe.", "Tip: drag the point along the curve."], ["ne semble pas dérivable en", "does not seem differentiable at"], ["soit", "i.e."], ["Début", "Start"], ["Pas", "Step"], ["Lignes", "Rows"], ["Copier le tableau", "Copy the table"], ["Tableau copié (collable dans un tableur)", "Table copied (paste it into a spreadsheet)"], ["non déf.", "undef."], ["Borne gauche", "Left bound"], ["Borne droite", "Right bound"], ["fenêtre", "window"], ["Vide = fenêtre visible. On peut écrire π/2, -inf, +inf…", "Empty = visible window. You can type π/2, -inf, +inf…"], ["Intervalle invalide.", "Invalid interval."], ["Intervalle d'étude invalide.", "Invalid study interval."], ["Zéros de", "Zeros of"], ["Aucun zéro trouvé.", "No zero found."], ["Extremums locaux", "Local extrema"], ["Aucun extremum local trouvé.", "No local extremum found."], ["Maximum", "Maximum"], ["Minimum", "Minimum"], ["(tangente horizontale)", "(horizontal tangent)"], ["(point anguleux)", "(corner point)"], ["en x =", "at x ="], ["x tend vers", "x tends to"], [": pas de limite détectée (oscillation ou calcul instable)", ": no limit detected (oscillation or unstable computation)"], ["est continue en", "is continuous at"], ["≠ limite :", "≠ limit:"], ["n'est pas continue en", "is not continuous at"], ["mais y admet une limite finie (prolongement par continuité possible).", "but has a finite limit there (continuous extension possible)."], ["n'est pas définie en", "is not defined at"], ["Limites à gauche et à droite différentes : pas de limite en", "Different left and right limits: no limit at"], ["est asymptote verticale à 𝒞", "is a vertical asymptote to 𝒞"], ["Valeur k", "Value k"], ["Faites glisser la droite y = k.", "Drag the line y = k."], ["Équation", "Equation"], ["solutions", "solutions"], ["solution", "solution"], ["Aucune solution trouvée sur cet intervalle.", "No solution found on this interval."], ["Tableau obtenu numériquement sur [", "Table obtained numerically on ["], ["] : à justifier par l'étude du signe de", "]: to be justified by studying the sign of"], ["n'est définie nulle part sur cet intervalle.", "is defined nowhere on this interval."], ["Borne a", "Bound a"], ["Borne b", "Bound b"], ["Entre la courbe et", "Between the curve and"], ["l'axe des abscisses", "the x-axis"], ["‖i‖ en cm", "‖i‖ in cm"], ["‖j‖ en cm", "‖j‖ in cm"], ["optionnel", "optional"], ["Bornes finies requises.", "Finite bounds required."], ["La fonction n'est pas définie (ou pas bornée) sur tout [", "The function is not defined (or not bounded) on all of ["], ["] : intégrale non calculable ici.", "]: integral cannot be computed here."], ["Aire du domaine coloré :", "Area of the shaded region:"], ["u.a.", "a.u."], ["cm², soit", "cm², i.e."], ["La fonction change de signe sur l'intervalle : l'intégrale et l'aire diffèrent.", "The function changes sign on the interval: integral and area differ."], ["Tracer la courbe de f⁻¹ (symétrique par rapport à y = x)", "Draw the curve of f⁻¹ (reflection in y = x)"], ["Restreignez l'intervalle à une zone où f est bijective (ex. tan sur ]−π/2 ; π/2[ : −pi/2 et pi/2) : seule cette partie est symétrisée.", "Restrict the interval to a region where f is bijective (e.g. tan on ]−π/2 ; π/2[: −pi/2 and pi/2): only that part is reflected."], ["Calculer (f⁻¹)′(b) pour b =", "Compute (f⁻¹)′(b) for b ="], ["réalise une bijection sur J = [", "is a bijection onto J = ["], ["] : elle réalise une bijection sur J = [", "]: it is a bijection onto J = ["], ["n'est pas strictement monotone (ou pas continue) sur cet intervalle : la courbe symétrique n'y est pas celle d'une fonction réciproque.", "is not strictly monotonic (or not continuous) on this interval: the reflected curve there is not that of an inverse function."], ["′ s'annule en ce point :", "′ vanishes at this point:"], ["⁻¹ n'y est pas dérivable (tangente verticale).", "⁻¹ is not differentiable there (vertical tangent)."], ["n'a pas d'antécédent sur l'intervalle.", "has no preimage on the interval."], ["antécédents : restreignez l'intervalle.", "preimages: restrict the interval."], ["n'est pas continue et strictement monotone sur un intervalle : pas de fonction réciproque. Restreignez", "is not continuous and strictly monotonic on an interval: no inverse function. Restrict"], ["(x initial ; x final) — voir « Étude complète ».", "(start x ; end x) — see « Full study »."], ["Courbe de", "Curve of"], ["⁻¹ : c'est la courbe d'une fonction seulement si", "⁻¹: it is the curve of a function only if"], ["est bijective (voir l'outil Réciproque)", "is bijective (see the Inverse tool)"], ["Tracer la courbe de", "Draw the curve of"], ["(symétrique par rapport à y = x)", "(reflection in y = x)"], ["Expression incomplète", "Incomplete expression"], ["Expression vide", "Empty expression"], ["Parenthèse fermante manquante", "Missing closing parenthesis"], ["Barre de valeur absolue manquante", "Missing absolute value bar"], ["» attendu", "» expected"], ["Symbole inattendu «", "Unexpected symbol «"], ["Caractère non reconnu : «", "Unrecognized character: «"], ["Nombre mal écrit", "Badly written number"], ["attend un seul argument", "expects a single argument"], ["racine : un seul argument attendu", "root: a single argument expected"], ["Écrire rac(n ; x), par ex. rac(3 ; x)", "Write rac(n ; x), e.g. rac(3 ; x)"], ["ne peut pas s'utiliser elle-même", "cannot use itself"], ["n'est pas une fonction définie", "is not a defined function"], ["Borne de restriction invalide", "Invalid restriction bound"], ["Restriction : il faut x initial < x final", "Restriction: start x must be < end x"], ["8 fonctions au maximum", "8 functions at most"], ["Code copié : collez-le dans « Charger un code »", "Code copied: paste it into « Load a code »"], ["Code invalide", "Invalid code"], ["Travail chargé", "Work loaded"], ["Nouveau travail", "New work"], ["Copie impossible", "Copy failed"], ["Plein écran indisponible ici", "Full screen unavailable here"], ["Aucune fonction", "No function"], ["Calcul impossible.", "Computation failed."], ["créée", "created"], ["Étude de fonctions", "Function study"], ["Kampyli — Étude de fonctions", "Kampyli — Function study"], ["La suite semble converger vers", "The sequence seems to converge to"], ["⇒ <b>tangente horizontale</b>", "⇒ horizontal tangent"], ["tangente d'inflexion", "inflection tangent"], ["Aucune racine réelle.", "No real root."], ["(multiplicité", "(multiplicity"], ["est la symétrique de", "is the reflection of"], ["est définie sur", "is defined on"], ["asymptote verticale", "a vertical asymptote"], ["au-dessus", "above"], ["au-dessous", "below"], ["strictement", "strictly"], ["continue", "continuous"], ["définie", "defined"], ["de [", "from ["], ["de ]", "from ]"], ["En", "At"], ["est", "is"], ["et", "and"], ["sur", "on"], ["à", "to"], ["de", "of"], ["en", "at"], ["la", "the"], ["le", "the"], ["les", "the"], ["une", "a"], ["un", "a"], ["ou", "or"], ["pour", "for"], ["avec", "with"], ["dans", "in"], ["si", "if"], ["Ou bien : point de 𝒞f⁻¹ d'abscisse b", "Or: point of 𝒞f⁻¹ with x-coordinate b"], ["Si le bouton f⁻¹ est actif : tangente à 𝒞f⁻¹ au point B(b ; f⁻¹(b)).", "If the f⁻¹ button is on: tangent to 𝒞f⁻¹ at B(b ; f⁻¹(b))."], ["Pour un point de 𝒞", "For a point of 𝒞"], [", activez le bouton", ", turn on the button"], ["strictement monotone, au besoin restreinte).", "strictly monotonic, restricted if needed)."], ["n'a pas d'antécédent unique par", "has no unique preimage under"], ["a une", "has a"], ["Tangentes de 𝒞", "Tangents of 𝒞"], ["(symétriques par rapport à y = x, en violet)", "(reflections in y = x, in purple)"], ["tangente à 𝒞", "tangent to 𝒞"], ["de pente 1/", "with slope 1/"], ["demi-tangente horizontale", "horizontal half-tangent"], ["demi-tangente verticale pour 𝒞", "vertical half-tangent for 𝒞"], ["demi-tangente horizontale de 𝒞", "horizontal half-tangent of 𝒞"], ["d'un côté.", "on one side."], ["Aucun point particulier : en tout point (", "No special point: at every point ("], ["de pente", "with slope"], ["Homographique", "Homographic"], ["Homographique (ax + b)/(cx + d)", "Homographic (ax + b)/(cx + d)"], ["f(x) = (ax + b) / (cx + d), avec c ≠ 0 et ad − bc ≠ 0", "f(x) = (ax + b) / (cx + d), with c ≠ 0 and ad − bc ≠ 0"], ["Tracer cette fonction", "Plot this function"], ["Tracer avec curseurs a, b, c, d", "Plot with sliders a, b, c, d"], ["Coefficients invalides", "Invalid coefficients"], ["c = 0 : f est une fonction affine, f(x) =", "c = 0: f is an affine function, f(x) ="], ["(non définie : d = 0)", "(undefined: d = 0)"], ["ad − bc = 0 : f est constante, égale à", "ad − bc = 0: f is constant, equal to"], ["(ce n'est pas une vraie fonction homographique).", "(not a true homographic function)."], ["Ensemble de définition", "Domain"], ["Déterminant", "Determinant"], ["Forme réduite", "Reduced form"], ["verticale x =", "vertical x ="], ["horizontale y =", "horizontal y ="], ["Centre de symétrie", "Centre of symmetry"], ["point d'intersection des asymptotes.", "intersection point of the asymptotes."], ["est une", "is a"], ["hyperbole", "hyperbola"], [": image de la courbe de x ↦", ": image of the curve of x ↦"], ["par la translation de vecteur OΩ.", "under the translation by vector OΩ."], ["Aperçu en noir : courbe, asymptotes et centre Ω. Les boutons ajoutent f à la liste des fonctions.", "Black preview: curve, asymptotes and centre Ω. The buttons add f to the function list."], ["sur ℝ \\ {", "on ℝ \\ {"], ["et sur", "and on"], ["Asymptotes", "Asymptotes"], ["−f, f(|x|), |f|", "−f, f(|x|), |f|"], ["Symétries", "Symmetries"], ["Transformation", "Transformation"], ["Créer cette fonction", "Create this function"], ["est la", "is the"], ["symétrique de 𝒞", "reflection of 𝒞"], ["par rapport à l'axe des abscisses (Ox)", "in the x-axis (Ox)"], ["par rapport à l'axe des ordonnées (Oy)", "in the y-axis (Oy)"], ["par rapport à l'origine O", "about the origin O"], ["Pour x ≥ 0 : g(x) =", "For x ≥ 0: g(x) ="], ["⇒ on", "⇒ we"], ["garde la partie de 𝒞", "keep the part of 𝒞"], ["située à droite de (Oy)", "to the right of (Oy)"], ["g est", "g is"], ["⇒ on complète par", "⇒ complete it by"], ["symétrie par rapport à (Oy)", "reflection in (Oy)"], ["(La partie de 𝒞", "(The part of 𝒞"], ["à gauche de (Oy) disparaît.)", "to the left of (Oy) disappears.)"], ["Là où", "Where"], ["et 𝒞", "and 𝒞"], ["sont confondues.", "coincide."], ["⇒ on remplace cette partie par sa", "⇒ replace this part by its"], ["symétrique par rapport à (Ox)", "reflection in (Ox)"], ["Changements de signe aux zéros de", "Sign changes at the zeros of"], ["(points anguleux possibles de 𝒞g).", "(possible corner points of 𝒞g)."], ["Aperçu de 𝒞g en noir. Le bouton ajoute g à la liste pour l'étudier.", "Black preview of 𝒞g. The button adds g to the list for study."], ["Recherche automatique des axes et centres de symétrie de 𝒞f. Pour vérifier un élément précis :", "Automatic search for axes and centres of symmetry of 𝒞f. To check a specific element:"], ["b (centre)", "b (centre)"], ["vide = axe", "empty = axis"], ["a seul : teste l'axe x = a. a et b : teste le centre Ω(a ; b).", "a alone: tests the axis x = a. a and b: tests the centre Ω(a ; b)."], ["Éléments de symétrie détectés", "Detected symmetry elements"], ["est un", "is an"], ["axe de symétrie", "axis of symmetry"], ["centre de symétrie", "centre of symmetry"], ["pour tout x de D,", "for every x in D,"], ["Aucun axe ni centre de symétrie détecté.", "No axis or centre of symmetry detected."], ["est constante : toute droite verticale est axe de symétrie.", "is constant: every vertical line is an axis of symmetry."], ["Vérification :", "Check:"], ["axe de symétrie ?", "axis of symmetry?"], ["centre de symétrie ?", "centre of symmetry?"], ["Condition : pour tout x de D,", "Condition: for every x in D,"], ["Vrai", "True"], ["(vérifié numériquement) : la droite x =", "(checked numerically): the line x ="], ["(vérifié numériquement) : Ω est un", "(checked numerically): Ω is a"], ["Faux", "False"], [": par exemple pour x =", ": for example for x ="], ["Recherche numérique : à démontrer avec la condition ci-dessus.", "Numerical search: to be proven with the condition above."], ["2. Parité, périodicité, symétries", "2. Parity, periodicity, symmetries"], ["axe x =", "axis x ="], ["x² − 4x + 1 (axe de symétrie)", "x² − 4x + 1 (axis of symmetry)"], ["x³ − 3x² + 2 (centre de symétrie)", "x³ − 3x² + 2 (centre of symmetry)"], ["ex. 1", "e.g. 1"], ["étant périodique de période", "being periodic with period"], [", ces éléments se répètent par translation : il y en a une infinité.", ", these elements repeat by translation: there are infinitely many."], ["La droite d'équation", "The line with equation"], ["La droite", "The line"], ["Tous droits réservés", "All rights reserved"], ["À propos", "About"], ["Fermer", "Close"], ["Version 1.1 · 2026", "Version 1.0 · 2026"], ["Application d'étude de fonctions pour le lycée : tracé de courbes, limites, dérivabilité, variations, convexité, branches infinies, symétries, fonction réciproque.", "Function study app for high school: curve plotting, limits, differentiability, variations, convexity, infinite branches, symmetries, inverse function."], ["Auteur :", "Author:"], ["Toute reproduction, modification ou diffusion de l'application, de son code, de son nom ou de son logo sans autorisation écrite de l'auteur est interdite.", "Any reproduction, modification or distribution of the app, its code, its name or its logo without the author's written permission is prohibited."], ["Les résultats sont obtenus par calcul numérique : ils servent à visualiser et vérifier, et doivent être démontrés par le calcul.", "Results are obtained by numerical computation: they help visualise and check, and must be proven by calculation."], ["Polices : IBM Plex Sans, IBM Plex Sans Arabic et IBM Plex Mono, © IBM Corp., sous licence SIL Open Font License 1.1.", "Fonts: IBM Plex Sans, IBM Plex Sans Arabic and IBM Plex Mono, © IBM Corp., under the SIL Open Font License 1.1."], ["⌨ Clavier", "⌨ Keyboard"], ["Clavier mathématique", "Math keyboard"], ["Fermer le clavier", "Close the keyboard"], ["Masquer / afficher le panneau", "Hide / show the panel"]];
 const EN_RX=EN_PAIRS.slice().sort((a,b)=>b[0].length-a[0].length).map(([fr,en])=>{ const e=fr.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); const pre=/^\p{L}/u.test(fr)?'(?<!\\p{L})':''; const post=/\p{L}$/u.test(fr)?'(?!\\p{L})':''; return [fr,new RegExp(pre+e+post,'gu'),en]; });
 function tr(str){ if(LANG!=='en'||!str) return str; for(const [fr,rx,en] of EN_RX){ if(str.includes(fr)) str=str.replace(rx,()=>en); } return str; }
 const ORIG_TXT=new Map(), ORIG_ATTR=new Map();
@@ -420,19 +482,30 @@ function compileAll(){
   for(const F of fns){
     F.compiled=null; F.error='';
     if(!F.expr.trim()) continue;
-    try{ const c=compile(F.expr,names,F.name); const raw=c.fn; F.raw=raw; F.compiled=raw; c.params.forEach(p=>used.add(p));
+    try{ const c=compile(F.expr,names,F.name); const raw=c.fn; F.raw=raw; F.compiled=raw; F.pwB=c.pw?raw.pwBounds:null; c.params.forEach(p=>used.add(p));
       const lo=parseValue(F.ra), hi=parseValue(F.rb);
       if(Number.isNaN(lo)||Number.isNaN(hi)) F.error='Borne de restriction invalide';
       else { const A=lo===null?-Infinity:lo, B=hi===null?Infinity:hi; F.rA=A; F.rB=B;
         if(isFinite(A)||isFinite(B)){ if(A>=B) F.error='Restriction : il faut x initial < x final';
           else { const cl=F.rac!==false, cr=F.rbc!==false; F.compiled=x=>((cl?x>=A:x>A)&&(cr?x<=B:x<B))?raw(x):NaN; } } }
-      FN_REGISTRY[F.name]=F.compiled; }
+      FN_REGISTRY[F.name]=F.compiled;
+      F.discrete=false; if(/pgcd|ppcm|gcd|lcm/i.test(F.expr)){ for(let k=-3;k<=3;k++){ const a=safe(F.compiled,k+0.5), b=safe(F.compiled,k); if(!isFinite(a)&&isFinite(b)){ F.discrete=true; break; } } } }
     catch(e){ F.error=e.message; }
   }
   used.forEach(p=>{ if(!PARAMS[p]) PARAMS[p]={v:1,min:-5,max:5,step:0.1}; });
   activeParams=[...used].sort();
 }
 
+function exprOf(F){ // expression « substituable » de F (sinon null : morceaux, restriction…)
+  if(!F||!F.expr||F.pwB||isFinite(F.rA)||isFinite(F.rB)) return null;
+  const e=String(F.expr).replace(/^\s*(?:[a-zA-Z]\s*\(\s*x\s*\)|y)\s*=/,'').trim(); return e||null; }
+function parE(e){ return /^[\w.√π²³]+$/.test(e)&&!/[+\-]/.test(e)?e:`(${e})`; }
+function prettyE(e){ let t=esc(String(e));
+  t=t.replace(/sqrt\(/g,'√(').replace(/\bpi\b/g,'π');
+  t=t.replace(/\^\(([^()]*)\)/g,'<sup>$1</sup>').replace(/\^(-?[0-9]+(?:[.,][0-9]+)?|[a-zA-Z])/g,'<sup>$1</sup>');
+  t=t.replace(/\*/g,' × ').replace(/(?<!<\/?su)-(?![^<]*>)/g,' − ').replace(/\+/g,' + ').replace(/\s+/g,' ').replace(/\( /g,'(').replace(/ \)/g,')').trim();
+  t=t.replace(/^ − /,'−').replace(/\(( − )/g,'(−').replace(/<sup> − /g,'<sup>−');
+  return t; }
 /* ---------------- Interface : fonctions ---------------- */
 let lastInput=null;
 function renderFns(){
@@ -440,12 +513,14 @@ function renderFns(){
   fns.forEach(F=>{
     const row=document.createElement('div');
     row.className='fn'+(F.visible?'':' off')+(F.error?' bad':'');
-    row.innerHTML=`<button class="dot" style="--c:${F.color}" title="Afficher / masquer"></button><span class="nm">${F.name}(x) =</span><input class="ex" spellcheck="false" autocomplete="off" autocapitalize="off" value="${esc(F.expr)}" placeholder="ex. x² − 2x + 1"><button class="inv${F.inv?' on':''}" style="--c:${F.color}" title="Tracer la courbe de ${F.name}⁻¹ (symétrique par rapport à y = x)">${F.name}⁻¹</button><button class="del" title="Supprimer">×</button><div class="err">${esc(F.error)}</div>
+    row.innerHTML=`<button class="dot" style="--c:${F.color}" title="Afficher / masquer"></button><span class="nm">${F.name}(x) =</span><input class="ex" spellcheck="false" autocomplete="off" autocapitalize="off" value="${esc(F.expr)}" placeholder="ex. x² − 2x + 1"><button class="pwb${F.pwOpen?' on':''}" style="--c:${F.color}" title="Fonction définie par morceaux (sur des intervalles)">{ }</button><button class="inv${F.inv?' on':''}" style="--c:${F.color}" title="Tracer la courbe de ${F.name}⁻¹ (symétrique par rapport à y = x)">${F.name}⁻¹</button><button class="del" title="Supprimer">×</button><div class="err">${esc(F.error)}</div>
       <div class="rst" title="Restriction de ${F.name} : x initial et x final (vide = −∞ / +∞). Cliquez sur un crochet pour l'ouvrir ou le fermer."><span>x ∈</span><button class="br bl">${(F.rac!==false&&String(F.ra||'').trim())?'[':']'}</button><input class="ra" value="${esc(F.ra||'')}" placeholder="−∞"><span>;</span><input class="rb" value="${esc(F.rb||'')}" placeholder="+∞"><button class="br brr">${(F.rbc!==false&&String(F.rb||'').trim())?']':'['}</button><span class="rh">restriction</span></div>
-      <div class="rwarn"></div>`;
+      <div class="rwarn"></div><div class="pwed" style="--c:${F.color}" ${F.pwOpen?'':'hidden'}></div>`;
     const inp=row.querySelector('input');
     inp.addEventListener('focus',()=>{ lastInput={inp,F}; });
-    inp.addEventListener('input',()=>{ F.expr=inp.value; onFnsChanged(); row.classList.toggle('bad',!!F.error); row.querySelector('.err').textContent=F.error; });
+    inp.addEventListener('input',()=>{ F.expr=inp.value; onFnsChanged(); row.classList.toggle('bad',!!F.error); row.querySelector('.err').textContent=F.error; if(F.pwOpen&&!row.querySelector('.pwed').contains(document.activeElement)) renderPw(F,row); });
+    const pwb=row.querySelector('.pwb'); if(F.pwOpen) renderPw(F,row);
+    pwb.onclick=()=>{ F.pwOpen=!F.pwOpen; pwb.classList.toggle('on',F.pwOpen); const ed=row.querySelector('.pwed'); ed.hidden=!F.pwOpen; if(F.pwOpen){ renderPw(F,row); const f0=ed.querySelector('input'); f0&&f0.focus(); } };
     const ra=row.querySelector('.ra'), rb=row.querySelector('.rb'), bl=row.querySelector('.bl'), br=row.querySelector('.brr');
     const syncBr=()=>{ bl.textContent=(F.rac!==false&&String(F.ra||'').trim())?'[':']'; br.textContent=(F.rbc!==false&&String(F.rb||'').trim())?']':'['; };
     ra.addEventListener('input',()=>{ F.ra=ra.value; syncBr(); onFnsChanged(); });
@@ -457,6 +532,29 @@ function renderFns(){
     row.querySelector('.del').onclick=()=>{ fns=fns.filter(G=>G!==F); if(!fns.length) newFn(''); renderFns(); onFnsChanged(); };
     el.appendChild(row);
   });
+}
+function parsePieces(expr){
+  const body=pwBody(expr||'');
+  if(body===null){ return [{e:String(expr||'').replace(/^\s*(?:[a-zA-Z]\s*\(\s*x\s*\)|y)\s*=/,'').trim(),c:''},{e:'',c:''}]; }
+  return splitTop(body,';').map(t=>t.trim()).filter(Boolean).map(pc=>{ const mE=PW_ELSE.exec(pc), mS=PW_SI.exec(pc);
+    if(mE&&(!mS||mE.index<mS.index)) return {e:pc.slice(0,mE.index).trim(),c:''};
+    if(!mS) return {e:pc,c:''};
+    return {e:pc.slice(0,mS.index).trim(),c:pc.slice(mS.index+mS[0].length).trim()}; });
+}
+function buildPieces(P){ const t=P.filter(p=>p.e.trim()).map(p=>p.c.trim()?`${p.e.trim()} si ${p.c.trim()}`:`${p.e.trim()} sinon`); return t.length?`{${t.join(' ; ')}}`:''; }
+function renderPw(F,row,P0,focusLast){
+  const ed=row.querySelector('.pwed'); const P=P0||parsePieces(F.expr); if(!P.length) P.push({e:'',c:''});
+  ed.innerHTML=`<div class="pt">${F.name}(x) définie par morceaux : une expression et sa condition sur x par ligne (ex. x < 1 ; −1 ≤ x < 2 ; x = 0). Condition vide = « sinon ».</div>`+
+    P.map((p,i)=>`<div class="pr"><b>${i+1}</b><input class="pe" data-i="${i}" spellcheck="false" autocomplete="off" autocapitalize="off" value="${esc(p.e)}" placeholder="expression"><span>si</span><input class="pc" data-i="${i}" spellcheck="false" autocomplete="off" autocapitalize="off" value="${esc(p.c)}" placeholder="${i===0?'x < 1':i===P.length-1?'sinon':'1 ≤ x < 2'}"><button class="px" data-i="${i}" title="Supprimer ce morceau">×</button></div>`).join('')+
+    `<div class="pf"><button class="pa">+ morceau</button><button class="pk">≤</button><button class="pk">&lt;</button><button class="pk">≥</button><button class="pk">&gt;</button><button class="pk">≠</button></div>`;
+  const sync=()=>{ F.expr=buildPieces(P); row.querySelector('input.ex').value=F.expr; onFnsChanged(); row.classList.toggle('bad',!!F.error); row.querySelector('.err').textContent=F.error; };
+  ed.querySelectorAll('.pe').forEach(el=>el.addEventListener('input',()=>{ P[+el.dataset.i].e=el.value; sync(); }));
+  ed.querySelectorAll('.pc').forEach(el=>el.addEventListener('input',()=>{ P[+el.dataset.i].c=el.value; sync(); }));
+  ed.querySelectorAll('.px').forEach(b=>b.onclick=()=>{ P.splice(+b.dataset.i,1); if(!P.length) P.push({e:'',c:''}); renderPw(F,row,P); sync(); });
+  ed.querySelector('.pa').onclick=()=>{ P.push({e:'',c:''}); renderPw(F,row,P,true); };
+  let lastC=null; ed.addEventListener('focusin',e=>{ if(e.target.tagName==='INPUT') lastC=e.target; });
+  ed.querySelectorAll('.pk').forEach(b=>{ b.addEventListener('mousedown',e=>e.preventDefault()); b.onclick=()=>{ const t=lastC||ed.querySelector('.pc'); if(!t) return; const a=t.selectionStart??t.value.length, z=t.selectionEnd??a; t.value=t.value.slice(0,a)+b.textContent+t.value.slice(z); t.focus(); t.setSelectionRange(a+1,a+1); t.dispatchEvent(new Event('input',{bubbles:true})); }; });
+  if(focusLast){ const ins=ed.querySelectorAll('.pe'); ins[ins.length-1].focus(); }
 }
 function onFnsChanged(){
   compileAll();
@@ -479,6 +577,7 @@ const KB={
  f:{cols:6,keys:[['sin','sin()',1],['cos','cos()',1],['tan','tan()',1],['arcsin','arcsin()',1],['arccos','arccos()',1],['arctan','arctan()',1],
    ['ln','ln()',1],['log','log()',1],['exp','exp()',1],['eˣ','e^()',1],['√','√()',1],['∛','∛()',1],
    ['ⁿ√','rac( ; x)',6],['|x|','||',1],['E(x)','E()',1],['min','min( ; )',4],['max','max( ; )',4],['xⁿ','^'],
+   ['pgcd','pgcd( ; )',4],['ppcm','ppcm( ; )',4],['{ }','{ si  ; sinon}',12],['si',' si '],['<','<'],['≤','≤'],['>','>'],['≥','≥'],
    ['(','('],[')',')'],[';',' ; '],['⌫','BS'],['←','LEFT'],['→','RIGHT']]},
  a:{cols:10,keys:[...'azertyuiop'].map(c=>[c,c]).concat([...'qsdfghjklm'].map(c=>[c,c]),[['⌫','BS']],[...'wxcvbn'].map(c=>[c,c]),[["'","'"],['←','LEFT'],['→','RIGHT'],['↵','CLOSE']])}
 };
@@ -647,6 +746,20 @@ function plot(f,color,lw=2.6,dash=null,marks=true){
     if(isFinite(yv)&&((isFinite(yl)&&!same(yl,yv))||(isFinite(yr)&&!same(yr,yv)))) endDot(xs,yv,color,false);
   }
 }
+function pwDots(F){ // points de raccordement d'une fonction par morceaux
+  const f=F.compiled, seen=new Set();
+  for(const bf of F.pwB){ const c=safe(bf,0); if(!isFinite(c)||c<view.xmin||c>view.xmax) continue; const k=c.toPrecision(10); if(seen.has(k)) continue; seen.add(k);
+    const e=1e-9*(1+Math.abs(c)), yv=safe(f,c), yl=safe(f,c-e), yr=safe(f,c+e), same=(u,v)=>Math.abs(Y(u)-Y(v))<1.5;
+    const L=isFinite(yl), Rr=isFinite(yr), V=isFinite(yv);
+    if(L&&Rr&&!same(yl,yr)) continue; // saut : déjà marqué par plot()
+    const side=L?yl:(Rr?yr:NaN);
+    if(!isFinite(side)){ if(V) endDot(c,yv,F.color,false); continue; }
+    if(V&&same(yv,side)){ if(!(L&&Rr)) endDot(c,yv,F.color,false); continue; }
+    endDot(c,side,F.color,true); if(V) endDot(c,yv,F.color,false);
+  } }
+function plotInt(f,color){ // fonction définie seulement aux entiers (pgcd, ppcm) : points
+  const a=Math.ceil(view.xmin), b=Math.floor(view.xmax), step=Math.max(1,Math.ceil((b-a)/600));
+  for(let k=a;k<=b;k+=step){ const y=safe(f,k); if(isFinite(y)) endDot(k,y,color,false); } }
 function endDot(x,y,color,open){ const px=X(x), py=Y(y); if(px<-5||px>W+5||py<-5||py>H+5) return;
   ctx.save(); ctx.beginPath(); ctx.arc(px,py,4,0,7); ctx.fillStyle=open?'#fff':color; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle=color; ctx.stroke(); ctx.restore(); }
 function plotParam(fx,fy,t0,t1,color,lw=2,dash=null){
@@ -689,10 +802,11 @@ function draw(){
   drawGrid();
   const T=activeTool&&TOOLS.find(t=>t.id===activeTool);
   if(T&&T.drawUnder) try{ T.drawUnder(); }catch(e){}
-  for(const F of fns) if(F.visible&&F.compiled) plot(F.compiled,F.color);
+  for(const F of fns) if(F.visible&&F.compiled){ if(F.discrete) plotInt(F.compiled,F.color); else plot(F.compiled,F.color); }
   for(const F of fns){ if(!F.visible||!F.compiled||!F.raw||F.compiled===F.raw) continue;
     if(isFinite(F.rA)){ const v=safe(F.raw,F.rA); if(isFinite(v)) endDot(F.rA,v,F.color,F.rac===false); }
     if(isFinite(F.rB)){ const v=safe(F.raw,F.rB); if(isFinite(v)) endDot(F.rB,v,F.color,F.rbc===false); } }
+  for(const F of fns){ if(!F.visible||!F.compiled||!F.pwB) continue; try{ pwDots(F); }catch(e){} }
   for(const B of asymCache){ try{ if(showAsym&&B.F.visible) B.draw(); if(invOK(B.F)) drawSymAsym(B); }catch(e){} }
   const invs=fns.filter(F=>invOK(F));
   if(invs.length){ const span=(view.xmax-view.xmin)*3; line(view.xmin-span,view.xmin-span,view.xmax+span,view.xmax+span,'#9a958b',1.2,[6,4]);
@@ -704,6 +818,7 @@ function draw(){
       for(const fr of [0.85,0.7,0.55,0.3]){ const t=t0+(t1-t0)*fr, x=safe(F.compiled,t); if(isFinite(x)&&X(x)>20&&X(x)<W-70){ halo2('𝒞'+F.name+'⁻¹',X(x)+8,Y(t)+18); break; } }
       ctx.restore(); } }
   if(T&&T.draw) try{ T.draw(); }catch(e){ console.error(e); }
+  try{ drawTrace(); }catch(e){ console.error(e); }
   // étiquettes des courbes
   ctx.save(); ctx.textAlign='left'; ctx.textBaseline='alphabetic'; ctx.font='600 14px "IBM Plex Mono", monospace';
   for(const F of fns){ if(!F.visible||!F.compiled) continue;
@@ -712,12 +827,67 @@ function draw(){
   ctx.restore();
   drawHover();
 }
+/* ---- Parcourir la courbe ---- */
+const trace={on:false,name:null,x:0,play:null};
+function traceF(){ let F=fnByName(trace.name); if(!F||!F.compiled||!F.visible){ F=fns.find(G=>G.compiled&&G.visible)||null; trace.name=F?F.name:null; } return F; }
+function traceRes(){ const pxw=(view.xmax-view.xmin)/W; return Math.pow(10,Math.floor(Math.log10(pxw*1.5))); }
+function traceSnap(x){ const TF=traceF(); if(TF&&TF.discrete) return Math.round(x); const r=traceRes(); let v=Math.round(x/r)*r; const n=Math.round(x); if(Math.abs(X(n)-X(x))<5) v=n; return +v.toPrecision(12); }
+function traceStep(){ const TF=traceF(); if(TF&&TF.discrete) return 1; const w=(view.xmax-view.xmin)/80, k=Math.pow(10,Math.floor(Math.log10(w))), m=w/k; return (m<1.5?1:m<3.5?2:m<7.5?5:10)*k; }
+function traceGrab(p){ // vrai si le doigt est près d'une courbe (sinon : déplacement du repère)
+  const x=invX(p.x); let best=null;
+  for(const F of fns){ if(!F.visible||!F.compiled) continue; const y=safe(F.compiled,x); if(!isFinite(y)) continue; const d=Math.abs(Y(y)-p.y); if(!best||d<best.d) best={d,F}; }
+  const cur=traceF(); const cy=cur?safe(cur.compiled,trace.x):NaN; const nearPt=cur&&isFinite(cy)&&Math.hypot(X(trace.x)-p.x,Y(cy)-p.y)<36;
+  if(nearPt){ return true; }
+  if(best&&best.d<36){ trace.name=best.F.name; trace.x=traceSnap(x); updTfn(); requestDraw(); return true; }
+  return false; }
+function oneSided(f,x){ const h=1e-5*(1+Math.abs(x)), y=f(x);
+  const l=(3*y-4*f(x-h)+f(x-2*h))/(2*h), r=(-3*y+4*f(x+h)-f(x+2*h))/(2*h); return [l,r]; }
+function drawTrace(){
+  if(!trace.on){ return; } const F=traceF(); const rd=$('#tread');
+  if(!F){ rd.textContent=tr('Aucune fonction'); return; }
+  const f=F.compiled, x=trace.x, y=safe(f,x), C=F.color, xs=fmt(x,4);
+  if(!isFinite(y)){ vline(x,'#9a958b',[3,4]); tag(`${F.name} n'est pas définie en ${xs}`,X(x)+8,H/2,'#6c6862'); rd.textContent=`x = ${xs}   ${F.name}(x) : ${tr('non déf.')}`; return; }
+  const px=X(x), py=Y(y), ox=Math.max(0,Math.min(W,X(0))), oy=Math.max(0,Math.min(H,Y(0)));
+  ctx.save(); ctx.strokeStyle=C; ctx.globalAlpha=.55; ctx.setLineDash([4,4]); ctx.lineWidth=1.3;
+  ctx.beginPath(); ctx.moveTo(px,oy); ctx.lineTo(px,py); ctx.moveTo(ox,py); ctx.lineTo(px,py); ctx.stroke(); ctx.restore();
+  let [dl,dr]=F.discrete?[NaN,NaN]:oneSided(v=>safe(f,v),x); let dtxt='';
+  const ok=v=>isFinite(v)&&Math.abs(v)<1e7, eq=ok(dl)&&ok(dr)&&Math.abs(dl-dr)<1e-3*(1+Math.abs(dl));
+  const seg=(d,side)=>{ const vx=W/(view.xmax-view.xmin), vy=H/(view.ymax-view.ymin); let ux=vx, uy=-d*vy; const n=Math.hypot(ux,uy); ux=ux/n*70; uy=uy/n*70;
+    ctx.save(); ctx.strokeStyle='#d32f2f'; ctx.lineWidth=2.2; ctx.beginPath();
+    if(side===0){ ctx.moveTo(px-ux,py-uy); ctx.lineTo(px+ux,py+uy); } else { ctx.moveTo(px,py); ctx.lineTo(px+side*ux,py+side*uy); }
+    ctx.stroke(); ctx.restore(); };
+  if(eq){ let d=deriv(v=>safe(f,v),x); if(!ok(d)) d=(dl+dr)/2; if(Math.abs(d)<1e-9) d=0; seg(d,0); dtxt=`${F.name}′(x) = ${fmt(d,4)}`; }
+  else if(F.discrete){ dtxt=''; } else { if(ok(dl)) seg(dl,-1); if(ok(dr)) seg(dr,1); dtxt=`${F.name}′g = ${ok(dl)?fmt(dl,3):'∞'} ; ${F.name}′d = ${ok(dr)?fmt(dr,3):'∞'}`; }
+  dot(x,y,C,null,{r:6.5});
+  tag(`M(${xs} ; ${fmt(y,4)})`,px+10,py-16,C);
+  ctx.save(); ctx.font='500 11.5px "IBM Plex Mono", monospace'; ctx.fillStyle=C; ctx.textAlign='center';
+  if(Math.abs(py-oy)>14) ctx.fillText(xs,px,oy+(py<oy?15:-7));
+  ctx.textAlign=px>ox?'right':'left'; if(Math.abs(px-ox)>30) ctx.fillText(fmt(y,4),ox+(px>ox?-5:5),py+4); ctx.restore();
+  const nb=t=>t.replace(/ /g,'\u00a0'); rd.textContent=`${nb('x = '+xs)}   ${nb(F.name+'(x) = '+fmt(y,4))}   ${dtxt.split(' ; ').map(nb).join(' ; ')}`;
+}
+function updTfn(){ const F=traceF(), b=$('#tfn'); b.textContent=F?F.name:'–'; b.style.background=F?F.color:'#999'; }
+function setTrace(on){ trace.on=on; $('#trace').classList.toggle('on',on); $('#tbar').hidden=!on; if(!on){ stopPlay(); }
+  else { const F=traceF(); if(F){ let x=traceSnap((view.xmin+view.xmax)/2); if(!isFinite(safe(F.compiled,x))){ for(let i=1;i<=200;i++){ const t=view.xmin+(view.xmax-view.xmin)*i/201; if(isFinite(safe(F.compiled,t))){ x=traceSnap(t); break; } } } trace.x=x; } updTfn(); }
+  requestDraw(); }
+function stopPlay(){ if(trace.play){ cancelAnimationFrame(trace.play); trace.play=null; } $('#tplay').textContent='▶'; }
+function startPlay(){ stopPlay(); $('#tplay').textContent='❚❚'; let t0=null;
+  const tick=t=>{ if(t0!==null){ const dx=(view.xmax-view.xmin)*(t-t0)/7000; trace.x+=dx; if(trace.x>view.xmax) trace.x=view.xmin; } t0=t; requestDraw(); trace.play=requestAnimationFrame(tick); };
+  trace.play=requestAnimationFrame(tick); }
+$('#trace').onclick=()=>setTrace(!trace.on);
+$('#tclose').onclick=()=>setTrace(false);
+$('#tprev').onclick=()=>{ stopPlay(); trace.x=traceSnap(trace.x-traceStep()); requestDraw(); };
+$('#tnext').onclick=()=>{ stopPlay(); trace.x=traceSnap(trace.x+traceStep()); requestDraw(); };
+$('#tplay').onclick=()=>{ trace.play?stopPlay():startPlay(); };
+$('#tfn').onclick=()=>{ const L=fns.filter(G=>G.compiled&&G.visible); if(!L.length) return; const i=L.findIndex(G=>G.name===trace.name); trace.name=L[(i+1)%L.length].name; updTfn(); requestDraw(); };
+document.addEventListener('keydown',e=>{ if(!trace.on||/INPUT|SELECT|TEXTAREA/.test(document.activeElement&&document.activeElement.tagName)) return;
+  if(e.key==='ArrowLeft'||e.key==='ArrowRight'){ e.preventDefault(); stopPlay(); trace.x=traceSnap(trace.x+(e.key==='ArrowLeft'?-1:1)*traceStep()*(e.shiftKey?10:1)); requestDraw(); }
+  if(e.key==='Escape') setTrace(false); });
 function halo2(t,x,y){ ctx.save(); ctx.strokeStyle='rgba(255,255,255,.95)'; ctx.lineWidth=4; ctx.strokeText(t,x,y); ctx.restore(); ctx.fillText(t,x,y); }
 function drawHover(){
   if(!mouse){ $('#coord').textContent=''; return; }
   const x=invX(mouse.x);
   $('#coord').textContent=`x = ${fmt(x,3)}   y = ${fmt(invY(mouse.y),3)}`;
-  if(dragging) return;
+  if(dragging||trace.on) return;
   let best=null;
   for(const F of fns){ if(!F.visible||!F.compiled) continue; const y=safe(F.compiled,x); if(!isFinite(y)) continue; const d=Math.abs(Y(y)-mouse.y); if(d<14&&(!best||d<best.d)) best={d,F,y}; }
   if(best){ dot(x,best.y,best.F.color,null,{r:4.5}); tag(`${best.F.name}(${fmt(x,3)}) = ${fmt(best.y,3)}`,X(x)+10,Y(best.y)-14,best.F.color); }
@@ -741,6 +911,7 @@ cv.addEventListener('pointerdown',e=>{
   if(pointers.size===2){ const [a,b]=[...pointers.values()]; pinch={d:Math.hypot(a.x-b.x,a.y-b.y)}; dragging={type:'pinch'}; return; }
   const T=activeTool&&TOOLS.find(t=>t.id===activeTool);
   if(T&&T.hit&&T.hit(p.x,p.y)){ dragging={type:'tool',T}; return; }
+  if(trace.on&&traceGrab(p)){ dragging={type:'trace'}; return; }
   dragging={type:'pan',x:p.x,y:p.y}; cv.classList.add('grab');
 });
 cv.addEventListener('pointermove',e=>{
@@ -756,6 +927,7 @@ cv.addEventListener('pointermove',e=>{
     view.xmin-=dx; view.xmax-=dx; view.ymin+=dy; view.ymax+=dy; dragging.x=p.x; dragging.y=p.y; viewChanged(); return;
   }
   if(dragging&&dragging.type==='tool'){ dragging.T.drag(p.x,p.y); return; }
+  if(dragging&&dragging.type==='trace'){ trace.x=traceSnap(invX(p.x)); requestDraw(); return; }
   requestDraw();
 });
 const endPtr=e=>{ pointers.delete(e.pointerId); if(pointers.size<2) pinch=null; if(!pointers.size){ dragging=null; cv.classList.remove('grab'); } requestDraw(); };
@@ -1060,7 +1232,7 @@ const TOOLS=[
   update(){ const F=target(); if(!F) return noFnMsg(); this.F=F; const f=F.compiled, n=F.name; this.draws=[]; let h='';
     for(const sg of [1,-1]){
       const inf=sg>0?'+∞':'−∞';
-      if(!isFinite(safe(f,sg*1e3))||!isFinite(safe(f,sg*1e5))){ h+=`<div class="blkr"><b>En ${inf}</b> : ${n} n'est pas définie au voisinage de ${inf}.</div>`; continue; }
+      if(Number.isNaN(safe(f,sg*30))||Number.isNaN(safe(f,sg*60))||[1e3,1e5].every(v=>Number.isNaN(safe(f,sg*v)))&&Number.isNaN(safe(f,sg*500))){ h+=`<div class="blkr"><b>En ${inf}</b> : ${n} n'est pas définie au voisinage de ${inf}.</div>`; continue; }
       const L=limitInf(f,sg).L; let t=`lim<sub>x→${inf}</sub> ${n}(x) ${limTxt(L)}<br>`;
       const pos=(g)=>{ const v=[1e2,1e3,1e4].map(x=>safe(g,sg*x)); if(v.every(d=>d>0)) return `𝒞${n} est <b>au-dessus</b> de l'asymptote au voisinage de ${inf}.`; if(v.every(d=>d<0)) return `𝒞${n} est <b>au-dessous</b> de l'asymptote au voisinage de ${inf}.`; return ''; };
       if(isFinite(L)){ t+=`⇒ La droite d'équation <span class="m"><b>y = ${shortX(L)}</b></span> est <b>asymptote horizontale</b> à 𝒞${n} au voisinage de ${inf}. `+pos(x=>f(x)-L); this.draws.push({t:'h',y:L,sg}); }
@@ -1198,12 +1370,15 @@ const TOOLS=[
   build(){ const st=this.state, A=fnByName(st.A), B=fnByName(st.B);
     if(!A||!A.compiled) return null;
     if(st.op==='k'){ const k=parseValue(st.k||'2'); if(!isFinite(k)) return null; const kk=valStr(k);
-      return {A,B:null,expr:`${kk.includes('/')||kk.startsWith('-')?'('+kk+')':kk}*${A.name}(x)`,txt:`${fmt(k)}·${A.name}`,h:x=>k*A.compiled(x)}; }
+      const ea=exprOf(A), kp=kk.includes('/')||kk.startsWith('-')?'('+kk+')':kk;
+      return {A,B:null,expr:ea!==null?`${kp}*${parE(ea)}`:`${kp}*${A.name}(x)`,ea,txt:`${fmt(k)}·${A.name}`,h:x=>k*A.compiled(x)}; }
     if(!B||!B.compiled) return null;
     const sym={'+':'+','-':'−','*':'×','/':'/'}[st.op], fa=A.compiled, fb=B.compiled;
     const h= st.op==='+'? x=>fa(x)+fb(x) : st.op==='-'? x=>fa(x)-fb(x) : st.op==='*'? x=>fa(x)*fb(x) : x=>{ const d=fb(x); return d===0?NaN:fa(x)/d; };
-    const expr= st.op==='/'? `${A.name}(x)/${B.name}(x)` : `${A.name}(x)${st.op}${B.name}(x)`;
-    return {A,B,expr,txt: st.op==='/'?`${A.name}/${B.name}`:`${A.name} ${sym} ${B.name}`,h}; },
+    const ea=exprOf(A), eb=exprOf(B); let expr;
+    if(ea!==null&&eb!==null){ expr= st.op==='/'? `(${ea})/(${eb})` : st.op==='*'? `${parE(ea)}*${parE(eb)}` : st.op==='-'? `${ea}-${parE(eb)}` : `${ea}+${eb}`; }
+    else expr= st.op==='/'? `${A.name}(x)/${B.name}(x)` : `${A.name}(x)${st.op}${B.name}(x)`;
+    return {A,B,expr,ea,eb,txt: st.op==='/'?`${A.name}/${B.name}`:`${A.name} ${sym} ${B.name}`,h}; },
   act(){ const r=this.build(); if(!r){ toast('Choisissez des fonctions valides'); return; }
     const G=newFn(r.expr); if(!G){ toast('8 fonctions au maximum'); return; } renderFns(); onFnsChanged(); toast(`${G.name}(x) = ${r.txt.replace(/ /g,'')}(x) créée`); },
   update(){ document.querySelectorAll('#panel [data-showk]').forEach(d=>d.hidden=this.state.op!=='k');
@@ -1214,7 +1389,11 @@ const TOOLS=[
     const r=this.build(); this.r=r; if(!r) return '';
     const A=r.A, B=r.B, a=A.name, b=B?B.name:'';
     const dom=f=>domainText({compiled:f,raw:f},analyze(f,-Infinity,Infinity,6000));
-    let h=`<div style="font-size:15px">(${r.txt})(x) = <span class="m">${this.state.op==='k'?r.txt.split('·')[0]+' × '+a+'(x)':this.state.op==='/'?a+'(x) / '+b+'(x)':a+'(x) '+{'+':'+','-':'−','*':'×'}[this.state.op]+' '+b+'(x)'}</span></div>`;
+    const op=this.state.op, PA=r.ea!=null?prettyE(r.ea):a+'(x)', PB=B?(r.eb!=null?prettyE(r.eb):b+'(x)'):'';
+    let h=`<div style="font-size:15px">(${r.txt})(x) = <span class="m">${op==='k'?r.txt.split('·')[0]+' × '+a+'(x)':op==='/'?`<span class="frac"><span>${a}(x)</span><span>${b}(x)</span></span>`:a+'(x) '+{'+':'+','-':'−','*':'×'}[op]+' '+b+'(x)'}</span></div>`;
+    if(op==='/') h+=`<div style="font-size:15px;margin-top:6px">(${r.txt})(x) = <span class="m"><span class="frac"><span>${PA}</span><span>${PB}</span></span></span></div>
+      <div class="blkr" style="margin-top:8px"><b>Numérateur</b> : N(x) = ${a}(x) = <span class="m">${PA}</span><br><b>Dénominateur</b> : D(x) = ${b}(x) = <span class="m">${PB}</span></div>`;
+    else if(r.ea!=null&&(!B||r.eb!=null)) h+=`<div style="font-size:15px;margin-top:6px">(${r.txt})(x) = <span class="m">${prettyE(r.expr)}</span></div>`;
     h+=`<div class="blkr" style="margin-top:8px"><b>Ensembles de définition</b><br>D<sub>${a}</sub> = <span class="m">${dom(A.compiled)}</span>`+(B?`<br>D<sub>${b}</sub> = <span class="m">${dom(B.compiled)}</span>`:'');
     if(this.state.op==='k') h+=`<br>D<sub>λ${a}</sub> = D<sub>${a}</sub>`;
     else if(this.state.op!=='/') h+=`<br>D<sub>${r.txt.replace(/ /g,'')}</sub> = D<sub>${a}</sub> ∩ D<sub>${b}</sub> = <span class="m">${dom(r.h)}</span>`;
@@ -1604,6 +1783,210 @@ boot();
 trObs.observe(document.body,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['title','placeholder']});
 document.querySelectorAll('.lang button').forEach(b=>b.onclick=()=>setLang(b.dataset.l));
 { const lg=document.querySelector('header.top svg'); if(lg){ const c=lg.cloneNode(true); c.setAttribute('width','52'); c.setAttribute('height','52'); c.querySelectorAll('[id]').forEach(n=>n.id=n.id+'a'); c.innerHTML=c.innerHTML.replace(/url\(#(\w+)\)/g,'url(#$1a)'); $('#aboutlogo').appendChild(c); } }
+/* ---------------- Scanner une fonction (photo → OCR) ---------------- */
+const OCR_SRC=(window.KOCR&&window.KOCR.script)||'https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js';
+let ocrWorker=null, scanImg=null, scanSel=null, scanRot=0;
+const scv=$('#scv'), sctx=scv.getContext('2d');
+function loadScript(src){ return new Promise((ok,ko)=>{ const t=document.createElement('script'); t.src=src; t.onload=ok; t.onerror=()=>ko(new Error('script')); document.head.appendChild(t); }); }
+async function getOcr(){
+  if(ocrWorker) return ocrWorker;
+  if(!window.Tesseract) await loadScript(OCR_SRC);
+  const o=Object.assign({},window.KOCR||{}); delete o.script;
+  o.logger=m=>{ if(m.status==='recognizing text') scanStat(`${tr('Lecture…')} ${Math.round(m.progress*100)} %`); else if(/load|initializ/.test(m.status)) scanStat(tr('Préparation de la lecture (la première fois, cela peut prendre un moment)…')); };
+  ocrWorker=await Tesseract.createWorker('eng',1,o);
+  await ocrWorker.setParameters({tessedit_pageseg_mode:'6',tessedit_char_whitelist:"0123456789xX+-=()/.,^|√²³eEalnsicotrpgqfVI[]{}<>;:'−–—×·",preserve_interword_spaces:'1'});
+  return ocrWorker;
+}
+function scanStat(t){ $('#scanstat').textContent=t; }
+function rotated(){ // image source tournée de scanRot × 90°
+  const w=scanImg.naturalWidth||scanImg.width, h=scanImg.naturalHeight||scanImg.height, r=scanRot%4;
+  const c=document.createElement('canvas'); c.width=r%2?h:w; c.height=r%2?w:h; const g=c.getContext('2d');
+  g.translate(c.width/2,c.height/2); g.rotate(r*Math.PI/2); g.drawImage(scanImg,-w/2,-h/2); return c; }
+let scanSrc=null;
+function scanShow(){
+  scanSrc=rotated(); const box=$('.swrap').clientWidth||560, maxH=Math.min(window.innerHeight*0.45,420);
+  const k=Math.min(box/scanSrc.width,maxH/scanSrc.height,1), d=window.devicePixelRatio||1;
+  scv.width=Math.round(scanSrc.width*k*d); scv.height=Math.round(scanSrc.height*k*d); scv.style.width=Math.round(scanSrc.width*k)+'px'; scv.style.height=Math.round(scanSrc.height*k)+'px';
+  scv._k=k*d; if(!scanSel) scanSel={x:0,y:0,w:scanSrc.width,h:scanSrc.height}; scanPaint(); }
+function scanPaint(){ const k=scv._k; sctx.drawImage(scanSrc,0,0,scv.width,scv.height);
+  const S=scanSel; if(!S) return; sctx.save(); sctx.fillStyle='rgba(13,35,120,.38)'; sctx.beginPath(); sctx.rect(0,0,scv.width,scv.height); sctx.rect(S.x*k,S.y*k,S.w*k,S.h*k); sctx.fill('evenodd');
+  sctx.strokeStyle='#f3b84a'; sctx.lineWidth=3; sctx.setLineDash([10,6]); sctx.strokeRect(S.x*k,S.y*k,S.w*k,S.h*k); sctx.restore(); }
+let selDrag=null;
+scv.addEventListener('pointerdown',e=>{ scv.setPointerCapture(e.pointerId); const r=scv.getBoundingClientRect(), k=scv._k/(window.devicePixelRatio||1); selDrag={x0:(e.clientX-r.left)/k,y0:(e.clientY-r.top)/k,k}; });
+scv.addEventListener('pointermove',e=>{ if(!selDrag) return; const r=scv.getBoundingClientRect(), k=selDrag.k; const x=(e.clientX-r.left)/k, y=(e.clientY-r.top)/k;
+  const cl=(v,m)=>Math.max(0,Math.min(m,v)); const x0=cl(Math.min(x,selDrag.x0),scanSrc.width), y0=cl(Math.min(y,selDrag.y0),scanSrc.height), x1=cl(Math.max(x,selDrag.x0),scanSrc.width), y1=cl(Math.max(y,selDrag.y0),scanSrc.height);
+  if(x1-x0>8&&y1-y0>8){ scanSel={x:x0,y:y0,w:x1-x0,h:y1-y0}; scanPaint(); } });
+scv.addEventListener('pointerup',()=>{ selDrag=null; });
+function prepCrop(){ // découpe, agrandit, binarise (seuil local ; tableau sombre → inversé), nettoie
+  const S=scanSel; let k=Math.min(4,1000/S.w); if(S.h*k<70) k=70/S.h; const w=Math.max(1,Math.round(S.w*k)), h=Math.max(1,Math.round(S.h*k));
+  const c=document.createElement('canvas'); c.width=w; c.height=h; const g=c.getContext('2d',{willReadFrequently:true});
+  g.imageSmoothingQuality='high'; g.drawImage(scanSrc,S.x,S.y,S.w,S.h,0,0,w,h);
+  const D=g.getImageData(0,0,w,h).data, N=w*h, G=new Float32Array(N);
+  for(let i=0;i<N;i++) G[i]=0.299*D[4*i]+0.587*D[4*i+1]+0.114*D[4*i+2];
+  const hist=new Uint32Array(256); for(let i=0;i<N;i++) hist[G[i]|0]++; let acc=0, md=0; for(let v=0;v<256;v++){ acc+=hist[v]; if(acc>=N/2){ md=v; break; } }
+  if(md<110) for(let i=0;i<N;i++) G[i]=255-G[i];   // craie sur tableau sombre
+  const I=new Float64Array((w+1)*(h+1));
+  for(let y=0;y<h;y++){ let row=0; for(let x=0;x<w;x++){ row+=G[y*w+x]; I[(y+1)*(w+1)+x+1]=I[y*(w+1)+x+1]+row; } }
+  const r=Math.max(12,Math.round(Math.max(h,w/6)/2.5)), B=new Uint8Array(N);
+  for(let y=0;y<h;y++){ const y0=Math.max(0,y-r), y1=Math.min(h,y+r+1); for(let x=0;x<w;x++){ const x0=Math.max(0,x-r), x1=Math.min(w,x+r+1);
+    const m=(I[y1*(w+1)+x1]-I[y0*(w+1)+x1]-I[y1*(w+1)+x0]+I[y0*(w+1)+x0])/((x1-x0)*(y1-y0)), v=G[y*w+x];
+    B[y*w+x]=(v<m*0.88&&m-v>22)?1:0; } }
+  // suppression des petites taches (composantes connexes)
+  const lab=new Int32Array(N), st=new Int32Array(N), minPx=Math.max(10,Math.round(N*0.00004)); let nl=0;
+  for(let i=0;i<N;i++){ if(!B[i]||lab[i]) continue; nl++; let sp=0, cnt=0; st[sp++]=i; lab[i]=nl; const comp=[];
+    while(sp){ const j=st[--sp]; comp.push(j); cnt++; const x=j%w, y=(j/w)|0;
+      for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]]){ const xx=x+dx, yy=y+dy; if(xx<0||yy<0||xx>=w||yy>=h) continue; const q=yy*w+xx; if(B[q]&&!lab[q]){ lab[q]=nl; st[sp++]=q; } } }
+    if(cnt<minPx) for(const j of comp) B[j]=0; }
+  // redressement (photo un peu penchée) : angle qui rend les lignes les plus nettes
+  const pts=[]; const stp=Math.max(1,Math.round(Math.sqrt(N/40000))); for(let y=0;y<h;y+=stp) for(let x=0;x<w;x+=stp) if(B[y*w+x]) pts.push(x,y);
+  let bestA=0, bestS=-1;
+  for(let a=-8;a<=8.01;a+=0.5){ const t=a*Math.PI/180, sn=Math.sin(t), cs=Math.cos(t), H2=new Float64Array(h*2+w);
+    for(let i=0;i<pts.length;i+=2){ const yy=Math.round(pts[i+1]*cs-pts[i]*sn)+w; if(yy>=0&&yy<H2.length) H2[yy]++; }
+    let sc=0; for(let i=1;i<H2.length;i++){ const d=H2[i]-H2[i-1]; sc+=d*d; } if(sc>bestS*1.0001){ bestS=sc; bestA=a; } }
+  if(Math.abs(bestA)>=0.5){ const t=bestA*Math.PI/180, sn=Math.sin(t), cs=Math.cos(t), cx=w/2, cy=h/2, B2=new Uint8Array(N);
+    for(let y=0;y<h;y++) for(let x=0;x<w;x++){ const dx=x-cx, dy=y-cy, sx=Math.round(cx+dx*cs-dy*sn), sy=Math.round(cy+dx*sn+dy*cs); if(sx>=0&&sy>=0&&sx<w&&sy<h&&B[sy*w+sx]) B2[y*w+x]=1; }
+    return {B:B2,w,h}; }
+  return {B,w,h}; }
+function binCanvas(P,R,pad=22){ // région R={x0,y0,x1,y1} de l'image binaire → toile blanche bordée
+  const W=R.x1-R.x0, H=R.y1-R.y0, c=document.createElement('canvas'); c.width=W+2*pad; c.height=H+2*pad; const g=c.getContext('2d');
+  const im=g.createImageData(c.width,c.height), d=im.data; d.fill(255);
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++) if(P.B[(y+R.y0)*P.w+x+R.x0]){ const j=4*((y+pad)*c.width+x+pad); d[j]=d[j+1]=d[j+2]=0; }
+  g.putImageData(im,0,0); return c; }
+function inkBox(P,R){ let x0=1e9,y0=1e9,x1=-1,y1=-1; for(let y=R.y0;y<R.y1;y++) for(let x=R.x0;x<R.x1;x++) if(P.B[y*P.w+x]){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
+  return x1<0?null:{x0,y0,x1:x1+1,y1:y1+1}; }
+function findFracBar(P,box){ // trait de fraction : longue ligne horizontale avec de l'encre au-dessus et au-dessous
+  let best=null; const bw=box.x1-box.x0, bh=box.y1-box.y0;
+  for(let y=box.y0;y<box.y1;y++){ let run=0, bs=0, mx=0, mxs=0; for(let x=box.x0;x<=box.x1;x++){ const v=x<box.x1&&P.B[y*P.w+x]; if(v){ if(!run) bs=x; run++; } else { if(run>mx){ mx=run; mxs=bs; } run=0; } }
+    if(mx>0.22*bw&&(!best||mx>best.len+2)) best={y,len:mx,x0:mxs,x1:mxs+mx}; }
+  if(!best) return null;
+  let t=best.y, u=best.y; const full=y=>{ let n=0; for(let x=best.x0;x<best.x1;x++) n+=P.B[y*P.w+x]; return n>0.8*(best.x1-best.x0); };
+  while(t>box.y0&&full(t-1)) t--; while(u<box.y1-1&&full(u+1)) u++;
+  if(u-t+1>0.12*bh) return null;
+  const above=inkBox(P,{x0:best.x0,y0:box.y0,x1:best.x1,y1:t}), below=inkBox(P,{x0:best.x0,y0:u+1,x1:best.x1,y1:box.y1});
+  if(!above||!below||above.y1-above.y0<0.12*bh||below.y1-below.y0<0.12*bh) return null;
+  return {t,u,x0:best.x0,x1:best.x1,above,below}; }
+function glyphs(P,R){ // composantes connexes de la région, regroupées en « caractères » (colonnes)
+  const {B,w}=P, seen=new Uint8Array(B.length), st=[], G=[];
+  for(let y=R.y0;y<R.y1;y++) for(let x=R.x0;x<R.x1;x++){ const i=y*w+x; if(!B[i]||seen[i]) continue;
+    let x0=x,x1=x,y0=y,y1=y,n=0; st.push(i); seen[i]=1;
+    while(st.length){ const j=st.pop(), jx=j%w, jy=(j/w)|0; n++; if(jx<x0)x0=jx; if(jx>x1)x1=jx; if(jy<y0)y0=jy; if(jy>y1)y1=jy;
+      for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){ const xx=jx+dx, yy=jy+dy; if(xx<R.x0||yy<R.y0||xx>=R.x1||yy>=R.y1) continue; const q=yy*w+xx; if(B[q]&&!seen[q]){ seen[q]=1; st.push(q); } } }
+    G.push({x0,x1:x1+1,y0,y1:y1+1,n,parts:1,flat:(x1-x0+1)>1.6*(y1-y0+1)}); }
+  G.sort((a,b)=>a.x0-b.x0);
+  const M=[]; for(const g of G){ const L=M[M.length-1];
+    if(L){ const ov=Math.min(L.x1,g.x1)-Math.max(L.x0,g.x0), mw=Math.min(L.x1-L.x0,g.x1-g.x0), vo=Math.min(L.y1,g.y1)-Math.max(L.y0,g.y0), dc=Math.abs((L.x0+L.x1)-(g.x0+g.x1))/2;
+      if(ov>0.5*mw&&(vo<=0||dc<0.2*Math.max(L.x1-L.x0,g.x1-g.x0))){ L.x0=Math.min(L.x0,g.x0); L.x1=Math.max(L.x1,g.x1); L.y0=Math.min(L.y0,g.y0); L.y1=Math.max(L.y1,g.y1); L.n+=g.n; L.parts+=g.parts; L.flat=L.flat&&g.flat; continue; } }
+    M.push({...g}); }
+  return M; }
+function supSegments(P,R){ // découpe une ligne en morceaux « normal » / « exposant » d'après la géométrie
+  const Gs=glyphs(P,R); if(Gs.length<2) return null;
+  const hs=Gs.map(g=>g.y1-g.y0), hmax=Math.max(...hs), hmed=med(hs.filter(h=>h>0.4*hmax));
+  const tall=Gs.filter(g=>g.y1-g.y0>0.75*hmed); if(tall.length<1) return null;
+  let cand=Gs.filter(g=>{ const h=g.y1-g.y0; return h>=0.33*hmax&&h<=0.78*hmax; }); if(!cand.length) cand=tall;
+  let base=0, bc=-1; for(const c of cand){ let n=0; for(const g of cand){ if(Math.abs(g.y1-c.y1)<0.1*hmax) n++; } if(n>bc||(n===bc&&c.y1>base)){ bc=n; base=c.y1; } }
+  const top=Math.min(...Gs.map(g=>g.y0)), bot=Math.max(...Gs.map(g=>g.y1));
+  if(bot-top>2.6*hmed) return null; // plusieurs lignes : pas de découpage
+  let any=false;
+  // italique : exposant collé au caractère précédent → on coupe là où le bas de l'encre « remonte »
+  for(let i=Gs.length-1;i>=0;i--){ const g=Gs[i]; if(g.x1-g.x0<0.9*hmed||g.y1<base-0.3*hmed) continue;
+    const bot=[]; for(let x=g.x0;x<g.x1;x++){ let b=-1; for(let y=g.y1-1;y>=g.y0;y--) if(P.B[y*P.w+x]){ b=y; break; } bot.push(b); }
+    let c=bot.length; while(c>0&&(bot[c-1]<0||bot[c-1]<base-0.3*hmed)) c--;
+    const run=bot.length-c; if(run<0.25*hmed||c<0.3*hmed) continue;
+    const L=inkBox(P,{x0:g.x0,y0:g.y0,x1:g.x0+c,y1:g.y1}), Rb=inkBox(P,{x0:g.x0+c,y0:g.y0,x1:g.x1,y1:g.y1}); if(!L||!Rb) continue;
+    Gs.splice(i,1,{...L,n:0,parts:1,flat:false},{...Rb,n:0,parts:1,flat:false}); }
+  const hsS=[...hs].sort((a,b)=>a-b), h75=hsS[Math.floor((hsS.length-1)*0.75)];
+  Gs.forEach((g,i)=>{ const h=g.y1-g.y0, wd=g.x1-g.x0, cy=(g.y0+g.y1)/2; g.thin=h<0.3*hmed||(wd>1.3*h&&h<0.6*hmed); g.sup=i>0&&g.y1<base-0.3*hmed&&cy<base-0.58*hmed; });
+  for(let i=Gs.length-1;i>=0;i--){ const g=Gs[i]; if(g.sup&&g.thin&&!(Gs[i+1]&&Gs[i+1].sup&&!Gs[i+1].thin)) g.sup=false; } // un « − » n'est exposant que s'il précède un exposant
+  Gs.forEach(g=>{ if(g.sup) any=true; });
+  if(!any) return {segs:null};
+  Gs.forEach(g=>{ const h=g.y1-g.y0; g.op=g.sup?null:(g.flat&&g.parts===1&&h<0.3*hmed?'-':(g.flat&&g.parts===2&&h<0.75*hmed?'=':null)); });
+  const segs=[]; for(const g of Gs){ const L=segs[segs.length-1]; if(g.op){ segs.push({op:g.op}); continue; } if(L&&!L.op&&L.sup===g.sup){ L.k++; L.x1=Math.max(L.x1,g.x1); L.y0=Math.min(L.y0,g.y0); L.y1=Math.max(L.y1,g.y1); } else segs.push({sup:g.sup,k:1,x0:g.x0,x1:g.x1,y0:g.y0,y1:g.y1}); }
+  return {segs,hmed,top,bot}; }
+function binCanvasScaled(P,R,target){ const c0=binCanvas(P,R,0), k=Math.max(1,Math.min(4,target/Math.max(1,R.y1-R.y0))), pad=22;
+  const c=document.createElement('canvas'); c.width=Math.round(c0.width*k)+2*pad; c.height=Math.round(c0.height*k)+2*pad; const g=c.getContext('2d');
+  g.fillStyle='#fff'; g.fillRect(0,0,c.width,c.height); g.imageSmoothingEnabled=false; g.drawImage(c0,pad,pad,c0.width*k,c0.height*k); return c; }
+async function ocrLine(w,P,R){ // une ligne : texte de base (exposants effacés) + exposants lus à part puis réinsérés
+  const S=supSegments(P,R);
+  if(!S||!S.segs){ const d=await ocrRegion(w,P,R,S?'7':'6'); return d?linesOf(d,!!S).map(l=>l.t).join(' '):''; }
+  const sups=S.segs.filter(g=>g.sup);
+  const pad=22, base=binCanvas(P,R,pad), g=base.getContext('2d'); g.fillStyle='#fff';
+  for(const u of sups) g.fillRect(u.x0-R.x0+pad-1,u.y0-R.y0+pad-1,u.x1-u.x0+2,u.y1-u.y0+2);
+  await w.setParameters({tessedit_pageseg_mode:'7'});
+  const r=await w.recognize(base,{},{text:true,blocks:true});
+  const sy=[]; for(const B of r.data.blocks||[]) for(const Pp of B.paragraphs||[]) for(const L of Pp.lines||[]) for(const W of L.words||[]) for(const q of W.symbols||[]) sy.push({t:q.text,cx:(q.bbox.x0+q.bbox.x1)/2-pad+R.x0});
+  const st=[]; for(const u of sups){
+    await w.setParameters({tessedit_pageseg_mode:u.k===1?'10':'8'});
+    const rr=await w.recognize(binCanvasScaled(P,{x0:u.x0,y0:u.y0,x1:u.x1,y1:u.y1},60),{},{text:true});
+    let t=(rr.data.text||'').replace(/\s+/g,'').replace(/[\^]/g,'').replace(/[−–—]/g,'-').replace(/^(=|--+|_)/,'-').replace(/^([a-z])\1+$/,'$1');
+    if(t) st.push({x:u.x0,t:t.length>1?`^(${t})`:`^${t}`}); }
+  let out='', j=0;
+  for(const q of sy){ while(j<st.length&&q.cx>st[j].x){ out+=st[j++].t; } out+=q.t; }
+  while(j<st.length) out+=st[j++].t;
+  return out; }
+async function ocrRegion(w,P,R,psm){ const b=inkBox(P,R); if(!b) return '';
+  await w.setParameters({tessedit_pageseg_mode:psm});
+  const r=await w.recognize(binCanvas(P,b),{},{text:true,blocks:true}); return r.data; }
+async function scanRead(w){
+  const P=prepCrop(), box=inkBox(P,{x0:0,y0:0,x1:P.w,y1:P.h}); if(!box) return '';
+  const fb=findFracBar(P,box);
+  if(!fb){ const S=supSegments(P,box); if(S) return cleanOcr(await ocrLine(w,P,box)); const d=await ocrRegion(w,P,box,'6'); return ocrToExpr(d); }
+  const part=async R=>{ const b=inkBox(P,R); return b?cleanOcr(await ocrLine(w,P,b)):''; };
+  const left=fb.x0-box.x0>8?await part({x0:box.x0,y0:box.y0,x1:fb.x0-2,y1:box.y1}):'';
+  const top=await part({x0:fb.x0,y0:box.y0,x1:fb.x1,y1:fb.t}), bot=await part({x0:fb.x0,y0:fb.u+1,x1:fb.x1,y1:box.y1});
+  const right=box.x1-fb.x1>8?await part({x0:fb.x1+2,y0:box.y0,x1:box.x1,y1:box.y1}):'';
+  let L=left; if(/=/.test(L)) L=L.replace(/^.*=/,''); else if(/^[a-zA-Z]\(?x\)?/.test(L)) L=''; if(/^[\^.\-]*$/.test(L)&&!/^-$/.test(L)) L='';
+  return `${L}(${top})/(${bot})${right}`; }
+const med=a=>{ const b=[...a].sort((p,q)=>p-q); return b.length?b[b.length>>1]:0; };
+function lineText(L){ // reconstitue une ligne en détectant les exposants (position des caractères)
+  const syms=[]; for(const w of L.words||[]){ (w.symbols||[]).forEach((sy,i)=>syms.push({t:sy.text,b:sy.bbox,sp:i===0&&syms.length>0,sup:sy.is_superscript})); }
+  if(!syms.length) return (L.text||'').trim();
+  const tall=syms.filter(q=>/[0-9()fEl]/.test(q.t)); const ref=tall.length>=2?tall:syms;
+  const base=med(ref.map(q=>q.b.y1)), hh=med(ref.map(q=>q.b.y1-q.b.y0))||1;
+  let out='', inSup=false, supBuf='';
+  const flush=()=>{ if(inSup){ out+= supBuf.length>1?`^(${supBuf})`:`^${supBuf}`; supBuf=''; inSup=false; } };
+  for(const q of syms){ const h=q.b.y1-q.b.y0, cy=(q.b.y0+q.b.y1)/2, op=/[+\-−=]/.test(q.t);
+    const isSup=out.length>0&&/[0-9a-zA-Z+\-−()/]/.test(q.t)&&(op?(cy<base-0.62*hh&&(inSup||true)):(q.sup||(q.b.y1<base-0.33*hh&&h<0.9*hh)));
+    if(isSup){ if(!inSup){ inSup=true; } supBuf+=q.t; } else { flush(); if(q.sp) out+=' '; out+=q.t; } }
+  flush(); return out; }
+function cleanOcr(t){
+  t=t.replace(/[−–—]/g,'-').replace(/[×·]/g,'*').replace(/X/g,'x').replace(/\s+/g,' ').trim();
+  t=t.replace(/^.*?=\s*/,'');                       // retire « f(x) = »
+  t=t.replace(/[Il1|]n\s*\(/g,'ln(').replace(/\b[Il]n\s*(?=x)/g,'ln ').replace(/(^|[^a-z])1og\(/g,'$1log(');
+  t=t.replace(/V(?=[\dx(])/g,'√').replace(/(\d)O|O(\d)/g,(m,a,b)=>a?a+'0':'0'+b);
+  t=t.replace(/\^\(([^()]*)\)/g,(m,a)=>/^[0-9a-z]$/.test(a)?'^'+a:m);
+  t=t.replace(/\s*([+\-*/^=()])\s*/g,'$1').replace(/\s+/g,'');
+  t=t.replace(/-{2,}/g,'-').replace(/\+{2,}/g,'+');
+  let o=0, c=0; for(const ch of t){ if(ch==='(') o++; else if(ch===')') c++; }
+  if(c>o&&!t.startsWith('(')) t='('.repeat(c-o)+t; else if(o>c) t=t+')'.repeat(o-c);
+  return t; }
+function linesOf(data,plain){ const lines=[]; for(const B of data.blocks||[]) for(const P of B.paragraphs||[]) for(const L of P.lines||[]){ const t=plain?(L.text||'').trim():lineText(L); if(t.trim()) lines.push({t,b:L.bbox}); } return lines; }
+function ocrToExpr(data){
+  const lines=linesOf(data);
+  let L=lines.filter(l=>!/^[\s\-_—–=.]+$/.test(l.t));
+  L=L.map(l=>({...l,t:l.t.replace(/^\s*[a-zA-Z]\s*\(\s*[xX]\s*\)\s*=\s*/,'')})).filter(l=>l.t.trim());
+  if(L.length===2) return `(${cleanOcr(L[0].t)})/(${cleanOcr(L[1].t)})`;
+  return cleanOcr(L.map(l=>l.t).join(' ')) || cleanOcr(data.text||''); }
+function checkScan(){ const v=$('#scanres').value, e=$('#scanerr'); try{ compile(v,new Set(fns.map(F=>F.name)),null); e.textContent=tr('✓ Expression valide'); e.classList.add('ok'); }catch(err){ e.textContent=tr(err.message); e.classList.remove('ok'); } }
+$('#scanres').addEventListener('input',checkScan);
+$('#scanbtn').onclick=()=>{ const f=$('#scanfile'); f.value=''; f.click(); };
+$('#scanagain').onclick=()=>{ const f=$('#scanfile'); f.value=''; f.click(); };
+$('#scanfile').onchange=e=>{ const file=e.target.files&&e.target.files[0]; if(!file) return; const url=URL.createObjectURL(file); const im=new Image();
+  im.onload=()=>{ scanImg=im; scanRot=0; scanSel=null; $('#scan').hidden=false; $('#scanout').hidden=true; scanStat(''); requestAnimationFrame(scanShow); };
+  im.onerror=()=>toast('Image illisible'); im.src=url; };
+$('#scanrot').onclick=()=>{ if(!scanImg) return; scanRot=(scanRot+1)%4; scanSel=null; scanShow(); };
+$('#scanclose').onclick=()=>{ $('#scan').hidden=true; };
+$('#scan').onclick=e=>{ if(e.target.id==='scan') $('#scan').hidden=true; };
+$('#scanread').onclick=async()=>{
+  if(!scanSrc) return; const b=$('#scanread'); b.disabled=true;
+  try{ if(!navigator.onLine&&!ocrWorker) throw new Error('offline');
+    scanStat(tr('Préparation de la lecture (la première fois, cela peut prendre un moment)…'));
+    const w=await getOcr(); const ex=await scanRead(w); $('#scanres').value=ex; $('#scanout').hidden=false; checkScan();
+    scanStat(ex?tr('Lecture terminée : vérifiez le résultat (exposants, fractions, signes).'):tr('Aucun texte reconnu : recadrez plus serré ou reprenez la photo.'));
+  }catch(err){ console.error(err); scanStat(tr('La lecture nécessite une connexion Internet (la première fois). Réessayez une fois connecté.')); }
+  finally{ b.disabled=false; } };
+$('#scanuse').onclick=()=>{ const v=$('#scanres').value.trim(); if(!v) return;
+  let F=fns.length===1?fns[0]:(fns.find(G=>!G.expr.trim())||newFn('')); if(!F){ F=fns[fns.length-1]; }
+  F.expr=v; F.ra=''; F.rb=''; renderFns(); onFnsChanged(); targetName=F.name; $('#scan').hidden=true; toast(`${F.name}(x) = ${v}`); };
 $('#aboutbtn').onclick=()=>{ $('#about').hidden=false; };
 $('#aboutclose').onclick=()=>{ $('#about').hidden=true; };
 $('#about').onclick=e=>{ if(e.target.id==='about') $('#about').hidden=true; };
