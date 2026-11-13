@@ -78,8 +78,7 @@
     </h2>
     <div id="fnlist"></div>
     <div class="row"><button class="btn" id="addfn">+ Ajouter une fonction</button></div>
-    <div class="row" style="gap:6px"><button class="btn kbtog" id="kbtog" title="Clavier mathématique">⌨ Clavier</button><button class="btn kbtog" id="scanbtn" title="Photographier une fonction écrite et la taper automatiquement">📷 Scanner</button></div>
-    <input type="file" id="scanfile" accept="image/*" hidden>
+    <button class="btn kbtog" id="kbtog" title="Clavier mathématique">⌨ Clavier</button>
   </section>
 
   <section class="blk" id="prmblk" hidden>
@@ -137,19 +136,6 @@
   </div>
   <footer class="copy">© 2026 Prof. TAIB Oussama — Tous droits réservés · <button id="aboutbtn">À propos</button></footer>
 </aside>
-<div id="scan" class="modal" hidden><div class="mbox sbox">
-  <button class="mclose" id="scanclose" title="Fermer">×</button>
-  <div style="font-size:17px;font-weight:700;color:#0d2378;margin-bottom:2px">📷 Scanner une fonction</div>
-  <p class="hint" style="margin:0 0 8px">Encadrez la fonction (doigt ou souris), puis « Lire ». Une seule fonction, bien éclairée et nette.</p>
-  <div class="swrap"><canvas id="scv"></canvas></div>
-  <div class="srow"><button class="btn" id="scanagain">📷 Autre photo</button><button class="btn" id="scanrot" title="Tourner la photo">⟳</button><span style="flex:1"></span><button class="btn pri" id="scanread">Lire la fonction</button></div>
-  <div id="scanstat" class="hint"></div>
-  <div id="scanout" hidden>
-    <label class="fld"><span>Fonction lue — vérifiez et corrigez si besoin</span><input id="scanres" class="ex" spellcheck="false" autocomplete="off" autocapitalize="off"></label>
-    <div id="scanerr" class="serr"></div>
-    <div class="srow"><span style="flex:1"></span><button class="btn pri" id="scanuse">Tracer cette fonction</button></div>
-  </div>
-</div></div>
 <div id="about" class="modal" hidden><div class="mbox">
   <button class="mclose" id="aboutclose" title="Fermer">×</button>
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px"><div id="aboutlogo"></div><div><div style="font-size:22px;font-weight:700;color:#0d2378">Kampyli</div><div style="font-size:12.5px;color:var(--muted)">Version 1.1 · 2026</div></div></div>

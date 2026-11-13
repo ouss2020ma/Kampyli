@@ -45,14 +45,6 @@ section.blk h2{margin:0 0 10px;font-size:11.5px;text-transform:uppercase;letter-
 .modal[hidden]{display:none}
 .mbox{background:#fff;border-radius:14px;max-width:460px;width:100%;padding:20px 22px;position:relative;font-size:13.5px;line-height:1.55;box-shadow:0 10px 40px rgba(0,0,0,.25)}
 .mbox p{margin:8px 0}
-.sbox{max-width:620px;max-height:calc(100vh - 24px);overflow:auto}
-.swrap{background:#f1f0eb;border-radius:10px;overflow:hidden;touch-action:none;display:flex;justify-content:center}
-#scv{display:block;max-width:100%;cursor:crosshair;touch-action:none}
-.srow{display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap}
-#scanres{width:100%;border:1px solid var(--line);border-radius:7px;padding:8px 9px;font-family:var(--mono);font-size:15px;background:var(--soft)}
-.serr{color:var(--danger);font-size:12px;min-height:16px}
-.serr.ok{color:#2e7d32}
-#scanstat{min-height:18px;margin-top:6px}
 .mclose{position:absolute;top:10px;right:12px;border:0;background:none;font-size:22px;cursor:pointer;color:var(--muted)}
 .lang{position:absolute;top:14px;right:14px;display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
 .lang button{border:0;background:#fff;font-size:11.5px;font-weight:600;padding:4px 8px;cursor:pointer;color:var(--muted)}
