@@ -85,7 +85,7 @@ section.blk h2{margin:0 0 10px;font-size:11.5px;text-transform:uppercase;letter-
 .pwed .pf{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .pwed .pf button{border:1px solid var(--line);background:#fff;border-radius:6px;font-size:12px;padding:3px 8px;cursor:pointer}
 .pwed .pf small{font-size:11px;color:var(--muted)}
-.fn .rst{grid-column:3/7;display:flex;align-items:center;gap:4px;font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:-4px}
+.fn .rst{grid-column:3/7;display:flex;align-items:center;gap:4px;white-space:nowrap;font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:-4px}
 .fn .rst input{width:62px;border:1px solid var(--line);border-radius:5px;padding:2px 5px;font-family:var(--mono);font-size:12px;background:#fff}
 .fn .rst .br{border:0;background:none;font-family:var(--mono);font-size:16px;font-weight:600;cursor:pointer;color:var(--ink);padding:0 2px}
 .fn .rst .rh{font-family:var(--sans);font-size:11px;margin-left:4px}
