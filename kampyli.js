@@ -1800,6 +1800,7 @@ async function getOcr(){
   o.logger=m=>{ if(m.status==='recognizing text') scanStat(`${tr('Lecture…')} ${Math.round(m.progress*100)} %`); else if(/load|initializ/.test(m.status)) scanStat(tr('Préparation de la lecture (la première fois, cela peut prendre un moment)…')); };
   try{ ocrWorker=await withTimeout(Tesseract.createWorker('eng',1,o),120000,'Délai dépassé pendant le chargement du module de lecture'); }
   catch(e){ if(cfg!==OCR_CDN&&!window.KOCR){ const o2=Object.assign({},OCR_CDN,{logger:o.logger}); delete o2.script; ocrWorker=await withTimeout(Tesseract.createWorker('eng',1,o2),120000,'Délai dépassé pendant le chargement du module de lecture'); } else throw e; }
+  try{ await buildTpl(cfg===OCR_CDN||window.KOCR&&!window.KOCR.fonts?'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/fonts/':(window.KOCR&&window.KOCR.fonts)||new URL('./ocr/',location.href).href); }catch(e){}
   await ocrWorker.setParameters({tessedit_pageseg_mode:'6',tessedit_char_whitelist:"0123456789xX+-=()/.,^|√²³eEalnsicotrpgqfVI[]{}<>;:'−–—×·",preserve_interword_spaces:'1'});
   return ocrWorker;
 }
@@ -1898,36 +1899,76 @@ function supSegments(P,R){ // découpe une ligne en morceaux « normal » / « e
     const bot=[]; for(let x=g.x0;x<g.x1;x++){ let b=-1; for(let y=g.y1-1;y>=g.y0;y--) if(P.B[y*P.w+x]){ b=y; break; } bot.push(b); }
     let c=bot.length; while(c>0&&(bot[c-1]<0||bot[c-1]<base-0.3*hmed)) c--;
     const run=bot.length-c; if(run<0.25*hmed||c<0.3*hmed) continue;
+    let onB=0; for(let k=0;k<c;k++) if(bot[k]>=base-0.15*hmed) onB++; if(onB<0.5*c) continue; // « + » : seule la barre touche la ligne de base
     const L=inkBox(P,{x0:g.x0,y0:g.y0,x1:g.x0+c,y1:g.y1}), Rb=inkBox(P,{x0:g.x0+c,y0:g.y0,x1:g.x1,y1:g.y1}); if(!L||!Rb) continue;
     Gs.splice(i,1,{...L,n:0,parts:1,flat:false},{...Rb,n:0,parts:1,flat:false}); }
   const hsS=[...hs].sort((a,b)=>a-b), h75=hsS[Math.floor((hsS.length-1)*0.75)];
   Gs.forEach((g,i)=>{ const h=g.y1-g.y0, wd=g.x1-g.x0, cy=(g.y0+g.y1)/2; g.thin=h<0.3*hmed||(wd>1.3*h&&h<0.6*hmed); g.sup=i>0&&g.y1<base-0.3*hmed&&cy<base-0.58*hmed; });
   for(let i=Gs.length-1;i>=0;i--){ const g=Gs[i]; if(g.sup&&g.thin&&!(Gs[i+1]&&Gs[i+1].sup&&!Gs[i+1].thin)) g.sup=false; } // un « − » n'est exposant que s'il précède un exposant
   Gs.forEach(g=>{ if(g.sup) any=true; });
-  if(!any) return {segs:null};
+  if(!any) return {segs:null,Gs,hmed,top,bot,base};
   Gs.forEach(g=>{ const h=g.y1-g.y0; g.op=g.sup?null:(g.flat&&g.parts===1&&h<0.3*hmed?'-':(g.flat&&g.parts===2&&h<0.75*hmed?'=':null)); });
   const segs=[]; for(const g of Gs){ const L=segs[segs.length-1]; if(g.op){ segs.push({op:g.op}); continue; } if(L&&!L.op&&L.sup===g.sup){ L.k++; L.x1=Math.max(L.x1,g.x1); L.y0=Math.min(L.y0,g.y0); L.y1=Math.max(L.y1,g.y1); } else segs.push({sup:g.sup,k:1,x0:g.x0,x1:g.x1,y0:g.y0,y1:g.y1}); }
-  return {segs,hmed,top,bot}; }
+  return {segs,Gs,hmed,top,bot,base}; }
 function binCanvasScaled(P,R,target){ const c0=binCanvas(P,R,0), k=Math.max(1,Math.min(4,target/Math.max(1,R.y1-R.y0))), pad=22;
   const c=document.createElement('canvas'); c.width=Math.round(c0.width*k)+2*pad; c.height=Math.round(c0.height*k)+2*pad; const g=c.getContext('2d');
   g.fillStyle='#fff'; g.fillRect(0,0,c.width,c.height); g.imageSmoothingEnabled=false; g.drawImage(c0,pad,pad,c0.width*k,c0.height*k); return c; }
-async function ocrLine(w,P,R){ // une ligne : texte de base (exposants effacés) + exposants lus à part puis réinsérés
+/* ---- reconnaissance de secours par modèles (le « x » italique des sujets en LaTeX) ---- */
+let TPL=null; const TPL_CH='0123456789x+()=elnsicotarpzqfgE/|√π', TPL_N=24;
+function normBits(get,w,h){ const N=TPL_N, s=Math.max(w,h), ox=(s-w)/2, oy=(s-h)/2, out=new Float32Array(N*N), c=s/N;
+  for(let j=0;j<N;j++) for(let i=0;i<N;i++){ const x0=i*c-ox, y0=j*c-oy; let n=0,t=0;
+    const st=Math.max(1,c/4); for(let y=y0+st/2;y<y0+c;y+=st) for(let x=x0+st/2;x<x0+c;x+=st){ t++; const xi=Math.floor(x), yi=Math.floor(y); if(xi>=0&&yi>=0&&xi<w&&yi<h&&get(xi,yi)) n++; }
+    out[j*N+i]=t?n/t:0; }
+  let m=0; for(const v of out) m+=v; m/=out.length; let q=0; for(let k=0;k<out.length;k++){ out[k]-=m; q+=out[k]*out[k]; } q=Math.sqrt(q)||1; for(let k=0;k<out.length;k++) out[k]/=q; return out; }
+async function buildTpl(base){
+  if(TPL) return TPL;
+  for(const [n,f] of [['KMath','KaTeX_Math-Italic.woff2'],['KMain','KaTeX_Main-Regular.woff2']]){ try{ const ff=new FontFace(n,`url(${base}${f})`); await ff.load(); document.fonts.add(ff); }catch(e){} }
+  const fonts=['64px KMath','64px KMain','italic 64px serif','64px serif','64px sans-serif','italic 64px sans-serif'];
+  const c=document.createElement('canvas'); c.width=c.height=128; const g=c.getContext('2d',{willReadFrequently:true}); const T=[];
+  for(const fnt of fonts) for(const ch of TPL_CH){ g.fillStyle='#fff'; g.fillRect(0,0,128,128); g.fillStyle='#000'; g.font=fnt; g.textBaseline='middle'; g.textAlign='center'; g.fillText(ch,64,64);
+    const d=g.getImageData(0,0,128,128).data; let x0=128,y0=128,x1=-1,y1=-1; for(let y=0;y<128;y++) for(let x=0;x<128;x++) if(d[4*(y*128+x)]<128){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
+    if(x1<0) continue; const w=x1-x0+1, h=y1-y0+1; T.push({ch,ar:w/h,v:normBits((x,y)=>d[4*((y+y0)*128+x+x0)]<128,w,h)}); }
+  TPL=T; return T; }
+function classify(P,g){ if(!TPL) return null; const w=g.x1-g.x0, h=g.y1-g.y0; if(w<3||h<3) return null;
+  const v=normBits((x,y)=>P.B[(g.y0+y)*P.w+g.x0+x],w,h), ar=w/h, best={};
+  for(const t of TPL){ let d=0; for(let k=0;k<v.length;k++) d+=v[k]*t.v[k]; d-=0.25*Math.abs(Math.log(ar/t.ar)); if(!(t.ch in best)||d>best[t.ch]) best[t.ch]=d; }
+  return best; }
+const SUSPECT_X=new Set(['2','r','a','z','X','×','y','k','v','u','%']);
+function fixX(P,g,t){ // t : lecture de Tesseract pour ce caractère ; renvoie « x » si le modèle est nettement plus proche d'un x
+  const sc=classify(P,g); if(!sc) return t; const sx=sc['x']||-1, so=t in sc?sc[t]:-1;
+  if((t===''||SUSPECT_X.has(t))&&sx>0.5&&sx>so+0.06) return 'x';
+  return t; }
+function best2(sc){ let b=null,s1=-9,s2=-9; for(const k in sc){ const v=sc[k]; if(v>s1){ s2=s1; s1=v; b=k; } else if(v>s2) s2=v; } return {b,s1,s2}; }
+async function ocrBox(w,P,R,psm,scale){ await w.setParameters({tessedit_pageseg_mode:psm});
+  const r=await w.recognize(scale?binCanvasScaled(P,R,scale):binCanvas(P,R),{},{text:true});
+  return (r.data.text||'').replace(/\s+/g,'').replace(/[\^]/g,''); }
+async function ocrLine(w,P,R){ // une ligne : chaque caractère est reconnu par modèles ; les passages incertains sont lus par Tesseract
   const S=supSegments(P,R);
-  if(!S||!S.segs){ const d=await ocrRegion(w,P,R,S?'7':'6'); return d?linesOf(d,!!S).map(l=>l.t).join(' '):''; }
-  const sups=S.segs.filter(g=>g.sup);
-  const pad=22, base=binCanvas(P,R,pad), g=base.getContext('2d'); g.fillStyle='#fff';
-  for(const u of sups) g.fillRect(u.x0-R.x0+pad-1,u.y0-R.y0+pad-1,u.x1-u.x0+2,u.y1-u.y0+2);
-  await w.setParameters({tessedit_pageseg_mode:'7'});
-  const r=await w.recognize(base,{},{text:true,blocks:true});
-  const sy=[]; for(const B of r.data.blocks||[]) for(const Pp of B.paragraphs||[]) for(const L of Pp.lines||[]) for(const W of L.words||[]) for(const q of W.symbols||[]) sy.push({t:q.text,cx:(q.bbox.x0+q.bbox.x1)/2-pad+R.x0});
-  const st=[]; for(const u of sups){
-    await w.setParameters({tessedit_pageseg_mode:u.k===1?'10':'8'});
-    const rr=await w.recognize(binCanvasScaled(P,{x0:u.x0,y0:u.y0,x1:u.x1,y1:u.y1},60),{},{text:true});
-    let t=(rr.data.text||'').replace(/\s+/g,'').replace(/[\^]/g,'').replace(/[−–—]/g,'-').replace(/^(=|--+|_)/,'-').replace(/^([a-z])\1+$/,'$1');
-    if(t) st.push({x:u.x0,t:t.length>1?`^(${t})`:`^${t}`}); }
-  let out='', j=0;
-  for(const q of sy){ while(j<st.length&&q.cx>st[j].x){ out+=st[j++].t; } out+=q.t; }
-  while(j<st.length) out+=st[j++].t;
+  if(!S){ const d=await ocrRegion(w,P,R,'6'); return d?linesOf(d,false).map(l=>l.t).join(' '):''; }
+  const Gs=S.Gs, hm=S.hmed;
+  for(const G of Gs){ G.t=null; if(G.op){ G.t=G.op; continue; }
+    const h=G.y1-G.y0, wd=G.x1-G.x0;
+    if(G.sup&&G.flat&&h<0.3*hm){ G.t='-'; continue; }
+    if(!G.sup&&h<0.3*hm&&wd<0.5*hm){ const ar=wd/Math.max(1,h); G.t=(G.y1>S.base-0.3*hm&&h>0.1*hm&&ar>0.55&&ar<1.8)?'.':''; continue; }
+    const sc=classify(P,G); if(!sc) continue; const bb=best2(sc); G.bb=bb;
+    if(bb.s1>=0.62&&bb.s1-bb.s2>=0.08) G.t=bb.b; }
+  // un point n'est gardé qu'entre deux chiffres (nombre décimal)
+  Gs.forEach((G,i)=>{ if(G.t==='.'&&!(Gs[i-1]&&/\d/.test(Gs[i-1].t||'')&&Gs[i+1]&&/\d/.test(Gs[i+1].t||''))) G.t=''; });
+  const pick=(G,t)=>{ if(G.bb&&(!t||!TPL_CH.includes(t))&&G.bb.s1>=0.45) return G.bb.b; return t; };
+  // regroupe : passages « normaux » incertains et suites d'exposants
+  const parts=[]; for(const G of Gs){ const L=parts[parts.length-1];
+    if(L&&L.sup===!!G.sup&&!G.op&&!L.op&&(G.sup||(G.t===null)===(L.unk))){ L.g.push(G); continue; }
+    parts.push({sup:!!G.sup,op:!!G.op,unk:!G.sup&&G.t===null,g:[G]}); }
+  let out='';
+  for(const pt of parts){
+    const bx={x0:Math.min(...pt.g.map(g=>g.x0)),x1:Math.max(...pt.g.map(g=>g.x1)),y0:Math.min(...pt.g.map(g=>g.y0)),y1:Math.max(...pt.g.map(g=>g.y1))};
+    if(pt.sup){ let t; if(pt.g.every(g=>g.t!==null)) t=pt.g.map(g=>g.t).join('');
+      else { t=await ocrBox(w,P,bx,pt.g.length===1?'10':'8',60); t=t.replace(/[−–—]/g,'-').replace(/^(=|--+|_)/,'-').replace(/^([a-z])\1+$/,'$1'); if(pt.g.length===1&&t.length<=1) t=pick(pt.g[0],fixX(P,pt.g[0],t)); }
+      if(t) out+= t.length>1?`^(${t})`:`^${t}`; continue; }
+    if(!pt.unk){ out+=pt.g.map(g=>g.t).join(''); continue; }
+    let t=await ocrBox(w,P,{x0:bx.x0,x1:bx.x1,y0:S.top,y1:S.bot},pt.g.length===1?'10':'7',pt.g.length===1?60:0);
+    if(pt.g.length===1&&t.length<=1) t=pick(pt.g[0],fixX(P,pt.g[0],t));
+    out+=t; }
   return out; }
 async function ocrRegion(w,P,R,psm){ const b=inkBox(P,R); if(!b) return '';
   await w.setParameters({tessedit_pageseg_mode:psm});
@@ -1957,11 +1998,13 @@ function lineText(L){ // reconstitue une ligne en détectant les exposants (posi
 function cleanOcr(t){
   t=t.replace(/[−–—]/g,'-').replace(/[×·]/g,'*').replace(/X/g,'x').replace(/\s+/g,' ').trim();
   t=t.replace(/^.*?=\s*/,'');                       // retire « f(x) = »
+  t=t.replace(/^\s*[a-zA-Z]\s*\(\s*x\s*\)\s*[-:=]?\s*/,'');
   t=t.replace(/[Il1|]n\s*\(/g,'ln(').replace(/\b[Il]n\s*(?=x)/g,'ln ').replace(/(^|[^a-z])1og\(/g,'$1log(');
   t=t.replace(/V(?=[\dx(])/g,'√').replace(/(\d)O|O(\d)/g,(m,a,b)=>a?a+'0':'0'+b);
   t=t.replace(/\^\(([^()]*)\)/g,(m,a)=>/^[0-9a-z]$/.test(a)?'^'+a:m);
   t=t.replace(/\s*([+\-*/^=()])\s*/g,'$1').replace(/\s+/g,'');
   t=t.replace(/-{2,}/g,'-').replace(/\+{2,}/g,'+');
+  t=t.replace(/[.,;:]+$/,'');
   let o=0, c=0; for(const ch of t){ if(ch==='(') o++; else if(ch===')') c++; }
   if(c>o&&!t.startsWith('(')) t='('.repeat(c-o)+t; else if(o>c) t=t+')'.repeat(o-c);
   return t; }
